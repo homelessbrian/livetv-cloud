@@ -1,0 +1,183 @@
+// Runs the Worker locally against an emulated D1 database and a pretend Nuvio sign-in server.
+//   npm i --no-save miniflare && node test/worker.test.mjs
+import { Miniflare } from 'miniflare';
+import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
+
+const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+const jwt = (sub, expSec = Math.floor(Date.now() / 1000) + 3600) => `${b64({ alg: 'HS256' })}.${b64({ sub, exp: expSec })}.sig${sub}`;
+const USERS = {
+  A: '11111111-1111-4111-8111-111111111111',
+  B: '22222222-2222-4222-8222-222222222222',
+  C: '33333333-3333-4333-8333-333333333333',
+  D: '44444444-4444-4444-8444-444444444444',
+};
+const KEY = 'public-key';
+const tokens = Object.fromEntries(Object.keys(USERS).map((k) => [k, jwt(k)]));
+
+let nuvioCalls = 0;
+let nuvioMode = 'ok'; // ok | down | error500
+const mf = new Miniflare({
+  modules: true,
+  scriptPath: fileURLToPath(new URL('../src/index.js', import.meta.url)),
+  compatibilityDate: '2025-06-01',
+  d1Databases: { DB: 'test-db' },
+  outboundService: async (req) => {
+    const url = new URL(req.url);
+    assert.equal(url.host, 'api.nuvio.tv');
+    assert.equal(url.pathname, '/auth/v1/user');
+    nuvioCalls++;
+    if (nuvioMode === 'down') throw new Error('network down');
+    if (nuvioMode === 'error500') return new Response('oops', { status: 500 });
+    if (req.headers.get('apikey') !== KEY) return new Response('{}', { status: 401 });
+    const bearer = (req.headers.get('authorization') || '').replace('Bearer ', '');
+    const who = Object.keys(tokens).find((k) => tokens[k] === bearer);
+    if (!who) return new Response('{"msg":"bad jwt"}', { status: 401 });
+    return Response.json({ id: USERS[who], email: `${who}@example.com` });
+  },
+});
+
+const call = (method, path, who, body, headers = {}) =>
+  mf.dispatchFetch(`https://sync.test${path}`, {
+    method,
+    headers: {
+      ...(who ? { authorization: `Bearer ${tokens[who] ?? who}`, apikey: KEY } : {}),
+      ...(body ? { 'content-type': 'application/json' } : {}),
+      ...headers,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+const json = async (res) => res.json();
+const setup = (n, extra = {}) => ({ playlists: { t: 'str', v: `list-${n}` }, ...extra });
+
+let passed = 0;
+const test = async (name, fn) => {
+  await fn();
+  passed++;
+  console.log('ok -', name);
+};
+
+await test('health needs no sign-in', async () => {
+  const res = await call('GET', '/v1/health');
+  assert.equal(res.status, 200);
+});
+
+await test('sign-in problems are 401 and unknown routes are refused', async () => {
+  assert.equal((await call('GET', '/v1/setup')).status, 401);
+  assert.equal((await call('GET', '/v1/setup', 'not-a-token-at-all-1234567890')).status, 401);
+  const before = nuvioCalls;
+  const expired = jwt('A', Math.floor(Date.now() / 1000) - 10);
+  assert.equal((await call('GET', '/v1/setup', expired)).status, 401);
+  assert.equal(nuvioCalls, before, 'an expired token must not reach Nuvio');
+  const noKey = await mf.dispatchFetch('https://sync.test/v1/setup', { headers: { authorization: `Bearer ${tokens.A}` } });
+  assert.equal(noKey.status, 401);
+  const wrongKey = await mf.dispatchFetch('https://sync.test/v1/setup', { headers: { authorization: `Bearer ${tokens.A}`, apikey: 'nope' } });
+  assert.equal(wrongKey.status, 401);
+  assert.equal((await call('GET', '/v1/nothing', 'A')).status, 404);
+  assert.equal((await call('POST', '/v1/setup', 'A', {})).status, 405);
+});
+
+await test('nothing saved yet is 404', async () => {
+  assert.equal((await call('GET', '/v1/setup', 'A')).status, 404);
+  assert.equal((await call('GET', '/v1/setup/previous', 'A')).status, 404);
+});
+
+await test('first save, read back, and a second first-save is refused', async () => {
+  const put = await call('PUT', '/v1/setup', 'A', { baseRevision: 0, device: 'Living room', deviceId: 'tv-1', data: setup(1) });
+  assert.equal(put.status, 200);
+  assert.equal((await json(put)).revision, 1);
+  const got = await json(await call('GET', '/v1/setup', 'A'));
+  assert.equal(got.revision, 1);
+  assert.equal(got.device, 'Living room');
+  assert.deepEqual(got.data, setup(1));
+  const again = await call('PUT', '/v1/setup', 'A', { baseRevision: 0, data: setup(9) });
+  assert.equal(again.status, 409);
+  assert.equal((await json(again)).revision, 1);
+});
+
+await test('save keeps the previous copy; stale saves are refused', async () => {
+  const put = await call('PUT', '/v1/setup', 'A', { baseRevision: 1, device: 'Bedroom', deviceId: 'tv-2', data: setup(2) });
+  assert.equal((await json(put)).revision, 2);
+  const prev = await json(await call('GET', '/v1/setup/previous', 'A'));
+  assert.equal(prev.revision, 1);
+  assert.deepEqual(prev.data, setup(1));
+  const stale = await call('PUT', '/v1/setup', 'A', { baseRevision: 1, data: setup(3) });
+  assert.equal(stale.status, 409);
+  const body = await json(stale);
+  assert.equal(body.revision, 2);
+  assert.equal(body.device, 'Bedroom');
+  assert.deepEqual((await json(await call('GET', '/v1/setup', 'A'))).data, setup(2));
+});
+
+await test('accounts are separate', async () => {
+  assert.equal((await call('GET', '/v1/setup', 'B')).status, 404);
+  assert.equal((await call('PUT', '/v1/setup', 'B', { baseRevision: 0, data: setup('b') })).status, 200);
+  assert.deepEqual((await json(await call('GET', '/v1/setup', 'A'))).data, setup(2));
+  assert.deepEqual((await json(await call('GET', '/v1/setup', 'B'))).data, setup('b'));
+});
+
+await test('empty, oversized and broken saves are refused', async () => {
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: {} })).status, 422);
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2 })).status, 422);
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: [1] })).status, 422);
+  const big = { x: { t: 'str', v: 'y'.repeat(300 * 1024) } };
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: big })).status, 413);
+  const broken = await mf.dispatchFetch('https://sync.test/v1/setup', {
+    method: 'PUT', headers: { authorization: `Bearer ${tokens.A}`, apikey: KEY }, body: '{nope',
+  });
+  assert.equal(broken.status, 400);
+  assert.equal((await json(await call('GET', '/v1/setup', 'A'))).revision, 2, 'refused saves change nothing');
+});
+
+await test('two saves at the same moment: one wins, one is told to re-sync', async () => {
+  const [one, two] = await Promise.all([
+    call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: setup('x') }),
+    call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: setup('y') }),
+  ]);
+  assert.deepEqual([one.status, two.status].sort(), [200, 409]);
+  assert.equal((await json(await call('GET', '/v1/setup', 'A'))).revision, 3);
+});
+
+await test('a checked token is remembered; Nuvio is not asked every time', async () => {
+  await call('GET', '/v1/setup', 'D'); // first time
+  const before = nuvioCalls;
+  for (let i = 0; i < 5; i++) await call('GET', '/v1/setup', 'D');
+  assert.equal(nuvioCalls, before);
+});
+
+await test('Nuvio trouble is 503 (keep working offline), a rejected token is 401', async () => {
+  const fresh = jwt('B', Math.floor(Date.now() / 1000) + 7200);
+  tokens.B2 = fresh; // not known to the pretend Nuvio
+  assert.equal((await call('GET', '/v1/setup', 'B2')).status, 401);
+  nuvioMode = 'down';
+  assert.equal((await call('GET', '/v1/setup', jwt('C', Math.floor(Date.now() / 1000) + 5000))).status, 503);
+  nuvioMode = 'error500';
+  assert.equal((await call('GET', '/v1/setup', jwt('C', Math.floor(Date.now() / 1000) + 5001))).status, 503);
+  nuvioMode = 'ok';
+});
+
+await test('delete removes both copies and a later save starts over', async () => {
+  assert.equal((await call('DELETE', '/v1/setup', 'A')).status, 200);
+  assert.equal((await call('GET', '/v1/setup', 'A')).status, 404);
+  assert.equal((await call('GET', '/v1/setup/previous', 'A')).status, 404);
+  const old = await call('PUT', '/v1/setup', 'A', { baseRevision: 3, data: setup('z') });
+  assert.equal(old.status, 409);
+  assert.equal((await json(old)).revision, 0);
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 0, data: setup('z') })).status, 200);
+});
+
+await test('daily save limit', async () => {
+  let rev = 0;
+  let okCount = 0;
+  let refused;
+  for (let i = 0; i < 520; i++) {
+    const res = await call('PUT', '/v1/setup', 'C', { baseRevision: rev, data: setup(i) });
+    if (res.status === 200) { rev = (await json(res)).revision; okCount++; } else { refused = res; break; }
+  }
+  assert.equal(okCount, 500);
+  assert.equal(refused.status, 429);
+  assert.ok(Number(refused.headers.get('retry-after')) >= 60);
+});
+
+console.log(`\n${passed} tests passed`);
+await mf.dispose();
