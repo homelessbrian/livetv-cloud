@@ -66,6 +66,7 @@ const test = async (name, fn) => {
 await test('health needs no sign-in', async () => {
   const res = await call('GET', '/v1/health');
   assert.equal(res.status, 200);
+  assert.equal((await json(res)).encryption, 'ready');
 });
 
 await test('sign-in problems are 401 and unknown routes are refused', async () => {
@@ -272,6 +273,7 @@ await test('without the secret a save is refused and nothing readable is stored'
 
 await test('a short secret counts as no secret', async () => {
   const m = mf2({ SYNC_ENCRYPTION_KEY: 'too-short' });
+  assert.equal((await (await m.dispatchFetch('https://sync.test/v1/health')).json()).encryption, 'secret_too_short');
   const res = await call2(m, 'PUT', '/v1/setup', { baseRevision: 0, data: setup(1) });
   assert.equal(res.status, 503);
   assert.equal((await res.json()).error, 'encryption_not_set');

@@ -309,7 +309,11 @@ export default {
   async fetch(request, env) {
     try {
       const { pathname } = new URL(request.url);
-      if (pathname === '/v1/health') return reply(200, { ok: true });
+      if (pathname === '/v1/health') {
+        // Says only whether the secret is set and long enough, never what it is.
+        const secret = typeof env.SYNC_ENCRYPTION_KEY === 'string' ? env.SYNC_ENCRYPTION_KEY.trim() : '';
+        return reply(200, { ok: true, encryption: secret.length >= MIN_SECRET_LENGTH ? 'ready' : secret ? 'secret_too_short' : 'secret_missing' });
+      }
 
       const routes = {
         '/v1/setup': { GET: getSetup, PUT: (e, u) => putSetup(request, e, u), DELETE: deleteSetup },
