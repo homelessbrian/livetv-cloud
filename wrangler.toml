@@ -2,10 +2,8 @@ name = "livetv-cloud"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
 
-# The database. Cloudflare creates it on the first deploy if it does not exist yet.
-# If a deploy ever asks for an ID, create a D1 database in the dashboard and add
-#   database_id = "<its ID>"
-# as a new line under this block.
+# The database (created in the Cloudflare dashboard).
 [[d1_databases]]
 binding = "DB"
 database_name = "livetv-sync"
+database_id = "c7afd7cb-2b57-48f7-b39c-789c4faead22"
