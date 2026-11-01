@@ -17,8 +17,10 @@ const tokens = Object.fromEntries(Object.keys(USERS).map((k) => [k, jwt(k)]));
 
 let nuvioCalls = 0;
 let nuvioMode = 'ok'; // ok | down | error500
+const SECRET = 'test-secret-0123456789-abcdefghijklmnop-XYZ';
 const mf = new Miniflare({
   modules: true,
+  bindings: { SYNC_ENCRYPTION_KEY: SECRET },
   scriptPath: fileURLToPath(new URL('../src/index.js', import.meta.url)),
   compatibilityDate: '2025-06-01',
   d1Databases: { DB: 'test-db' },
@@ -50,6 +52,10 @@ const call = (method, path, who, body, headers = {}) =>
 const json = async (res) => res.json();
 const setup = (n, extra = {}) => ({ playlists: { t: 'str', v: `list-${n}` }, ...extra });
 
+const SCHEMA_FOR_TEST = `CREATE TABLE IF NOT EXISTS setups (
+  user_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL, saved_at INTEGER NOT NULL,
+  device TEXT NOT NULL DEFAULT '', device_id TEXT NOT NULL DEFAULT '', prev_revision INTEGER, prev_data TEXT,
+  prev_saved_at INTEGER, saves_day TEXT NOT NULL DEFAULT '', saves_count INTEGER NOT NULL DEFAULT 0)`;
 let passed = 0;
 const test = async (name, fn) => {
   await fn();
@@ -177,6 +183,112 @@ await test('daily save limit', async () => {
   assert.equal(okCount, 500);
   assert.equal(refused.status, 429);
   assert.ok(Number(refused.headers.get('retry-after')) >= 60);
+});
+
+// ---- encryption ----
+const dbOf = () => mf.getD1Database('DB');
+const rowOf = (id) => dbOf().then((db) => db.prepare('SELECT * FROM setups WHERE user_id = ?').bind(id).first());
+
+await test('what is stored is encrypted, not readable text', async () => {
+  const secretSetup = { xtream: { t: 'str', v: 'http://host/get.php?username=bob&password=hunter2-PIN-4321' } };
+  assert.equal((await call('PUT', '/v1/setup', 'D', { baseRevision: 0, data: secretSetup })).status, 200);
+  assert.equal((await call('PUT', '/v1/setup', 'D', { baseRevision: 1, data: secretSetup })).status, 200);
+  const row = await rowOf(USERS.D);
+  for (const stored of [row.data, row.prev_data]) {
+    assert.ok(stored.startsWith('enc1:'));
+    assert.ok(!stored.includes('hunter2') && !stored.includes('bob'));
+  }
+  assert.deepEqual((await json(await call('GET', '/v1/setup', 'D'))).data, secretSetup);
+  assert.deepEqual((await json(await call('GET', '/v1/setup/previous', 'D'))).data, secretSetup);
+});
+
+await test('same setup saved twice gives different stored text', async () => {
+  const one = (await rowOf(USERS.D)).data;
+  const prev = (await rowOf(USERS.D)).prev_data;
+  assert.notEqual(one, prev);
+});
+
+await test('a large setup (250 KB) saves and reads back', async () => {
+  const big = { x: { t: 'str', v: 'y'.repeat(250 * 1024) } };
+  const rev = (await json(await call('GET', '/v1/setup', 'D'))).revision;
+  assert.equal((await call('PUT', '/v1/setup', 'D', { baseRevision: rev, data: big })).status, 200);
+  assert.deepEqual((await json(await call('GET', '/v1/setup', 'D'))).data, big);
+});
+
+await test('a copy moved to another account cannot be read', async () => {
+  const db = await dbOf();
+  const mine = await rowOf(USERS.D);
+  await call('DELETE', '/v1/setup', 'B');
+  await db.prepare(`INSERT INTO setups (user_id, revision, data, saved_at) VALUES (?, 1, ?, 1)`).bind(USERS.B, mine.data).run();
+  assert.equal((await call('GET', '/v1/setup', 'B')).status, 503);
+  await call('DELETE', '/v1/setup', 'B');
+});
+
+await test('an older readable copy is still read, and gets encrypted', async () => {
+  const db = await dbOf();
+  const old = JSON.stringify(setup('old'));
+  await db.prepare(`INSERT INTO setups (user_id, revision, data, saved_at, prev_revision, prev_data, prev_saved_at) VALUES (?, 5, ?, 1, 4, ?, 1)`)
+    .bind(USERS.B, old, JSON.stringify(setup('older'))).run();
+  assert.deepEqual((await json(await call('GET', '/v1/setup', 'B'))).data, setup('old'));
+  const row = await rowOf(USERS.B);
+  assert.ok(row.data.startsWith('enc1:') && row.prev_data.startsWith('enc1:'));
+  assert.equal(row.revision, 5);
+  assert.deepEqual((await json(await call('GET', '/v1/setup/previous', 'B'))).data, setup('older'));
+});
+
+await test('saving over an older readable copy encrypts the moved-aside copy too', async () => {
+  const db = await dbOf();
+  await call('DELETE', '/v1/setup', 'B');
+  await db.prepare(`INSERT INTO setups (user_id, revision, data, saved_at) VALUES (?, 2, ?, 1)`).bind(USERS.B, JSON.stringify(setup('legacy'))).run();
+  assert.equal((await call('PUT', '/v1/setup', 'B', { baseRevision: 2, data: setup('new') })).status, 200);
+  const row = await rowOf(USERS.B);
+  assert.ok(row.data.startsWith('enc1:') && row.prev_data.startsWith('enc1:'));
+  assert.deepEqual((await json(await call('GET', '/v1/setup/previous', 'B'))).data, setup('legacy'));
+});
+
+// ---- no secret / wrong secret ----
+const mf2 = (bindings) => new Miniflare({
+  modules: true,
+  bindings,
+  scriptPath: fileURLToPath(new URL('../src/index.js', import.meta.url)),
+  compatibilityDate: '2025-06-01',
+  d1Databases: { DB: 'test-db' },
+  d1Persist: false,
+  outboundService: async () => Response.json({ id: USERS.A }),
+});
+const call2 = (m, method, path, body) => m.dispatchFetch(`https://sync.test${path}`, {
+  method,
+  headers: { authorization: `Bearer ${jwt('A')}`, apikey: KEY, ...(body ? { 'content-type': 'application/json' } : {}) },
+  body: body ? JSON.stringify(body) : undefined,
+});
+
+await test('without the secret a save is refused and nothing readable is stored', async () => {
+  const m = mf2({});
+  assert.equal((await call2(m, 'PUT', '/v1/setup', { baseRevision: 0, data: setup(1) })).status, 503);
+  const db = await m.getD1Database('DB');
+  assert.equal((await db.prepare('SELECT COUNT(*) AS n FROM setups').first()).n, 0);
+  await m.dispose();
+});
+
+await test('a short secret counts as no secret', async () => {
+  const m = mf2({ SYNC_ENCRYPTION_KEY: 'too-short' });
+  const res = await call2(m, 'PUT', '/v1/setup', { baseRevision: 0, data: setup(1) });
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).error, 'encryption_not_set');
+  await m.dispose();
+});
+
+await test('a different secret cannot read the copy', async () => {
+  const db = await dbOf();
+  const mine = await rowOf(USERS.D);
+  const m = mf2({ SYNC_ENCRYPTION_KEY: 'another-secret-0123456789-abcdefghijklmnop' });
+  const mdb = await m.getD1Database('DB');
+  await mdb.prepare(SCHEMA_FOR_TEST).run();
+  await mdb.prepare(`INSERT INTO setups (user_id, revision, data, saved_at) VALUES (?, 1, ?, 1)`).bind(USERS.A, mine.data).run();
+  const res = await call2(m, 'GET', '/v1/setup');
+  assert.equal(res.status, 503);
+  assert.equal((await res.json()).error, 'cannot_decrypt');
+  await m.dispose();
 });
 
 console.log(`\n${passed} tests passed`);

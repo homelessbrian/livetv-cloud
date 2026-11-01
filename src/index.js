@@ -11,6 +11,12 @@
 //   GET    /v1/setup/previous  the copy from before the last save  200 | 404
 //   GET    /v1/health          is the service up                   200
 //
+// The saved setup (it holds IPTV logins and the parental PIN) is encrypted before it goes into the
+// database: AES-256-GCM, with a separate key per Nuvio account made from the secret
+// SYNC_ENCRYPTION_KEY (set in the Cloudflare dashboard, never in the code). Without that secret a
+// save is refused, so nothing readable is ever written. A copy saved before this was added is
+// still read fine and is encrypted the next time it is touched.
+//
 // A save carries the revision it was based on. If someone else saved in between, it is refused
 // with 409 and the current revision, so a TV that was offline can never overwrite newer work.
 
@@ -33,6 +39,75 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS setups (
   saves_day TEXT NOT NULL DEFAULT '',
   saves_count INTEGER NOT NULL DEFAULT 0
 )`;
+
+const ENC_PREFIX = 'enc1:';
+const MIN_SECRET_LENGTH = 32;
+
+function toB64(bytes) {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 8192) out += String.fromCharCode(...bytes.subarray(i, i + 8192));
+  return btoa(out);
+}
+const fromB64 = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+
+/** This account's own key, made from the secret. Throws 503 if the secret is missing or too short. */
+async function accountKey(env, userId) {
+  const secret = typeof env.SYNC_ENCRYPTION_KEY === 'string' ? env.SYNC_ENCRYPTION_KEY.trim() : '';
+  if (secret.length < MIN_SECRET_LENGTH) throw new HttpError(503, 'encryption_not_set');
+  const enc = new TextEncoder();
+  const base = await crypto.subtle.importKey('raw', enc.encode(secret), 'HKDF', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: enc.encode('livetv-cloud-v1'), info: enc.encode(`setup:${userId}`) },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+/** Text -> "enc1:<iv>:<encrypted>". The account id is bound in, so a row can't be moved to another account. */
+async function encryptText(env, userId, plain) {
+  const key = await accountKey(env, userId);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const sealed = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(userId) },
+    key,
+    new TextEncoder().encode(plain)
+  );
+  return `${ENC_PREFIX}${toB64(iv)}:${toB64(new Uint8Array(sealed))}`;
+}
+
+const isEncrypted = (stored) => typeof stored === 'string' && stored.startsWith(ENC_PREFIX);
+
+/** Back to text. A copy saved before encryption existed is returned as it is. */
+async function decryptText(env, userId, stored) {
+  if (!isEncrypted(stored)) return stored;
+  const key = await accountKey(env, userId);
+  try {
+    const [iv, sealed] = stored.slice(ENC_PREFIX.length).split(':');
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: fromB64(iv), additionalData: new TextEncoder().encode(userId) },
+      key,
+      fromB64(sealed)
+    );
+    return new TextDecoder().decode(plain);
+  } catch {
+    throw new HttpError(503, 'cannot_decrypt');
+  }
+}
+
+/** Encrypts any older readable copy in place. Changes no revision; failing here changes nothing. */
+async function upgradeRow(env, userId, row) {
+  if (isEncrypted(row.data) && (!row.prev_data || isEncrypted(row.prev_data))) return;
+  try {
+    const data = isEncrypted(row.data) ? row.data : await encryptText(env, userId, row.data);
+    const prev = !row.prev_data || isEncrypted(row.prev_data) ? row.prev_data : await encryptText(env, userId, row.prev_data);
+    await env.DB.prepare('UPDATE setups SET data = ?, prev_data = ? WHERE user_id = ? AND revision = ?')
+      .bind(data, prev ?? null, userId, row.revision).run();
+  } catch {
+    // Secret not set yet, or somebody saved in between: try again on the next read.
+  }
+}
 
 /** Checked tokens for a few minutes, so the Nuvio sign-in server is not asked on every request. */
 const checked = new Map(); // sha256(token) -> { userId, until }
@@ -146,23 +221,27 @@ async function getRow(env, userId) {
 async function getSetup(env, userId) {
   const row = await getRow(env, userId);
   if (!row) throw new HttpError(404, 'none');
+  const data = JSON.parse(await decryptText(env, userId, row.data));
+  await upgradeRow(env, userId, row);
   return reply(200, {
     revision: row.revision,
     savedAt: row.saved_at,
     device: row.device,
     deviceId: row.device_id,
-    data: JSON.parse(row.data),
+    data,
   });
 }
 
 async function getPrevious(env, userId) {
   const row = await getRow(env, userId);
   if (!row || !row.prev_data) throw new HttpError(404, 'none');
+  const data = JSON.parse(await decryptText(env, userId, row.prev_data));
+  await upgradeRow(env, userId, row);
   return reply(200, {
     revision: row.prev_revision,
     savedAt: row.prev_saved_at,
     currentRevision: row.revision,
-    data: JSON.parse(row.prev_data),
+    data,
   });
 }
 
@@ -177,7 +256,7 @@ async function putSetup(request, env, userId) {
   const deviceId = text(body.deviceId, 80);
   const now = Date.now();
   const today = new Date(now).toISOString().slice(0, 10);
-  const encoded = JSON.stringify(data);
+  const encoded = await encryptText(env, userId, JSON.stringify(data));
 
   const row = await getRow(env, userId);
 
@@ -203,14 +282,17 @@ async function putSetup(request, env, userId) {
     throw new HttpError(429, 'too_many_saves', { retryAfter: Math.max(60, Math.ceil((midnight - now) / 1000)) });
   }
 
+  // The copy being replaced moves aside (encrypted, if it still was readable text).
+  const previous = isEncrypted(row.data) ? row.data : await encryptText(env, userId, row.data);
+
   // The previous copy moves aside, and the save only goes through if nobody saved in between.
   const saved = await env.DB.prepare(
     `UPDATE setups SET
-       prev_revision = revision, prev_data = data, prev_saved_at = saved_at,
+       prev_revision = revision, prev_data = ?, prev_saved_at = saved_at,
        revision = revision + 1, data = ?, saved_at = ?, device = ?, device_id = ?,
        saves_count = CASE WHEN saves_day = ? THEN saves_count + 1 ELSE 1 END, saves_day = ?
      WHERE user_id = ? AND revision = ?`
-  ).bind(encoded, now, device, deviceId, today, today, userId, row.revision).run();
+  ).bind(previous, encoded, now, device, deviceId, today, today, userId, row.revision).run();
   if (!saved.meta.changes) {
     const current = await getRow(env, userId);
     throw new HttpError(409, 'conflict', { revision: current?.revision ?? 0, savedAt: current?.saved_at, device: current?.device });
