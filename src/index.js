@@ -11,6 +11,11 @@
 //   GET    /v1/setup/previous  the copy from before the last save  200 | 404
 //   GET    /v1/health          is the service up                   200
 //
+// Private test builds (people with the tester key only; see the "Test builds" part below):
+//   GET    /v1/updates/test/latest        what the newest test build is        200 | 404
+//   GET    /v1/updates/test/apk/<code>    that test build's APK                200 | 404
+//   GET    /v1/updates/test/download      the newest APK (first install)       200 | 404
+//
 // The saved setup (it holds IPTV logins and the parental PIN) is encrypted before it goes into the
 // database: AES-256-GCM, with a separate key per Nuvio account made from the secret
 // SYNC_ENCRYPTION_KEY (set in the Cloudflare dashboard, never in the code). Without that secret a
@@ -305,6 +310,176 @@ async function deleteSetup(env, userId) {
   return reply(200, { ok: true });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Test builds: lets the test app (and a few testers) update from a private GitHub repo.
+//
+// The APKs are release files in a private repo. The TV can't sign in to GitHub, and a GitHub token
+// inside an app can be pulled out, so this Worker holds the token and hands the files only to a
+// caller with the tester key. Nothing here is stored; it only passes GitHub's answer along.
+//
+// One release per test build: tag "test-<versionCode>", release name = the version name, release
+// text = what changed, and one .apk file. Secrets (set in the Cloudflare dashboard, never in code):
+//   TESTER_KEY          the key testers use (several can be given, separated by commas; 16+ characters each)
+//   TEST_BUILDS_TOKEN   a GitHub token that can only read the private repo's contents
+// Optional: TEST_BUILDS_REPO ("owner/name", default homelessbrian/Nuvio_Testing).
+// Until both secrets are set every one of these routes simply answers 404/503.
+// ---------------------------------------------------------------------------------------------
+
+const GITHUB_API = 'https://api.github.com';
+const DEFAULT_TEST_REPO = 'homelessbrian/Nuvio_Testing';
+const TEST_LIST_CACHE_MS = 60 * 1000;
+const GITHUB_TIMEOUT_MS = 8000;
+const MIN_TESTER_KEY_LENGTH = 16;
+let testListCache = null; // { until, releases }
+
+const testKeys = (env) =>
+  String(env.TESTER_KEY || '').split(',').map((k) => k.trim()).filter((k) => k.length >= MIN_TESTER_KEY_LENGTH);
+
+/** Same length, compared without stopping at the first difference. */
+function sameHex(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+async function testerAllowed(request, env) {
+  const given = request.headers.get('x-tester-key') || new URL(request.url).searchParams.get('key') || '';
+  const keys = testKeys(env);
+  if (!given || keys.length === 0) return false;
+  const givenHash = await sha256Hex(given);
+  let allowed = false;
+  for (const key of keys) if (sameHex(givenHash, await sha256Hex(key))) allowed = true;
+  return allowed;
+}
+
+function githubHeaders(env, accept = 'application/vnd.github+json') {
+  return {
+    authorization: `Bearer ${env.TEST_BUILDS_TOKEN}`,
+    accept,
+    'user-agent': 'livetv-cloud',
+    'x-github-api-version': '2022-11-28',
+  };
+}
+
+function testRepo(env) {
+  const repo = String(env.TEST_BUILDS_REPO || DEFAULT_TEST_REPO).trim();
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new HttpError(503, 'test_updates_not_set');
+  return repo;
+}
+
+/** The test builds that exist, newest first (a minute of memory, so GitHub is not asked on every check). */
+async function testReleases(env) {
+  if (testListCache && testListCache.until > Date.now()) return testListCache.releases;
+  if (!env.TEST_BUILDS_TOKEN) throw new HttpError(503, 'test_updates_not_set');
+  let res;
+  try {
+    res = await fetch(`${GITHUB_API}/repos/${testRepo(env)}/releases?per_page=15`, {
+      headers: githubHeaders(env),
+      signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+    });
+  } catch {
+    throw new HttpError(503, 'github_unreachable');
+  }
+  if (!res.ok) throw new HttpError(503, 'github_unreachable');
+  let list;
+  try {
+    list = await res.json();
+  } catch {
+    throw new HttpError(503, 'github_unreachable');
+  }
+  const releases = (Array.isArray(list) ? list : [])
+    .filter((r) => r && !r.draft && /^test-\d{1,10}$/.test(r.tag_name || ''))
+    .map((r) => ({
+      versionCode: Number(r.tag_name.slice(5)),
+      versionName: text(r.name, 80) || r.tag_name,
+      notes: text(r.body, 4000),
+      publishedAt: r.published_at || r.created_at || null,
+      asset: (r.assets || []).find((a) => /\.apk$/i.test(a.name || '') && a.state === 'uploaded'),
+    }))
+    .filter((r) => r.asset)
+    .sort((a, b) => b.versionCode - a.versionCode);
+  testListCache = { until: Date.now() + TEST_LIST_CACHE_MS, releases };
+  return releases;
+}
+
+function testManifest(origin, releases) {
+  const [latest, ...older] = releases;
+  const sha = /^sha256:([0-9a-f]{64})$/i.exec(latest.asset.digest || '');
+  return {
+    channel: 'test',
+    versionName: latest.versionName,
+    versionCode: latest.versionCode,
+    publishedAt: latest.publishedAt,
+    notes: latest.notes,
+    apk: {
+      name: latest.asset.name,
+      size: latest.asset.size ?? null,
+      sha256: sha ? sha[1].toLowerCase() : null,
+      url: `${origin}/v1/updates/test/apk/${latest.versionCode}`,
+    },
+    previous: older.slice(0, 4).map((r) => ({
+      versionName: r.versionName,
+      versionCode: r.versionCode,
+      url: `${origin}/v1/updates/test/apk/${r.versionCode}`,
+    })),
+  };
+}
+
+/** Passes the APK from the private repo through to the caller without keeping it. */
+async function streamTestApk(env, release) {
+  const asset = release.asset;
+  let res;
+  try {
+    // GitHub answers with a short-lived signed address. That address must be asked for WITHOUT the
+    // token, so the first answer is read here and not followed automatically.
+    res = await fetch(`${GITHUB_API}/repos/${testRepo(env)}/releases/assets/${asset.id}`, {
+      headers: githubHeaders(env, 'application/octet-stream'),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const where = res.headers.get('location') || '';
+      if (!/^https:\/\//i.test(where)) throw new Error('bad redirect');
+      res = await fetch(where);
+    }
+  } catch {
+    throw new HttpError(503, 'github_unreachable');
+  }
+  if (!res.ok || !res.body) throw new HttpError(503, 'github_unreachable');
+  const headers = {
+    'content-type': 'application/vnd.android.package-archive',
+    'content-disposition': `attachment; filename="${String(asset.name).replace(/[^A-Za-z0-9._-]/g, '_')}"`,
+    'cache-control': 'no-store',
+  };
+  const length = res.headers.get('content-length');
+  if (length) headers['content-length'] = length;
+  return new Response(res.body, { status: 200, headers });
+}
+
+async function testUpdates(request, env, pathname) {
+  // Anyone without the key gets the same answer as for a page that doesn't exist.
+  if (request.method !== 'GET' || !(await testerAllowed(request, env))) throw new HttpError(404, 'not_found');
+  const path = pathname.replace(/\/+$/, '');
+  const releases = await testReleases(env);
+
+  if (path === '/v1/updates/test/latest') {
+    if (!releases.length) throw new HttpError(404, 'none');
+    return reply(200, testManifest(new URL(request.url).origin, releases));
+  }
+  if (path === '/v1/updates/test/download') {
+    if (!releases.length) throw new HttpError(404, 'none');
+    return streamTestApk(env, releases[0]);
+  }
+  const apk = /^\/v1\/updates\/test\/apk\/(\d{1,10})$/.exec(path);
+  if (apk) {
+    const release = releases.find((r) => r.versionCode === Number(apk[1]));
+    if (!release) throw new HttpError(404, 'none');
+    return streamTestApk(env, release);
+  }
+  throw new HttpError(404, 'not_found');
+}
+
 export default {
   async fetch(request, env) {
     try {
@@ -312,8 +487,13 @@ export default {
       if (pathname === '/v1/health') {
         // Says only whether the secret is set and long enough, never what it is.
         const secret = typeof env.SYNC_ENCRYPTION_KEY === 'string' ? env.SYNC_ENCRYPTION_KEY.trim() : '';
-        return reply(200, { ok: true, encryption: secret.length >= MIN_SECRET_LENGTH ? 'ready' : secret ? 'secret_too_short' : 'secret_missing' });
+        return reply(200, {
+          ok: true,
+          encryption: secret.length >= MIN_SECRET_LENGTH ? 'ready' : secret ? 'secret_too_short' : 'secret_missing',
+          testUpdates: testKeys(env).length > 0 && env.TEST_BUILDS_TOKEN ? 'ready' : 'not_set',
+        });
       }
+      if (pathname.startsWith('/v1/updates/test/')) return await testUpdates(request, env, pathname);
 
       const routes = {
         '/v1/setup': { GET: getSetup, PUT: (e, u) => putSetup(request, e, u), DELETE: deleteSetup },
