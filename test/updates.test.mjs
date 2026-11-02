@@ -192,6 +192,39 @@ await test('the list is remembered for a minute so GitHub is not asked every tim
   assert.equal(githubCalls, 1 + 1, 'one list call plus one file call');
 });
 
+await test('phone test builds have their own list and never mix with the TV ones', async (m) => {
+  const mobile = (code) => release(code, {
+    tag_name: `mobile-test-${code}`,
+    name: `Mobile 0.6.6-test.${code}`,
+    assets: [{ id: code * 10, name: `Nuvio-IPTV-Mobile-Test-${code}.apk`, size: APK_BYTES.length, state: 'uploaded', digest: `sha256:${sha}` }],
+  });
+  releases = [mobile(900), release(57), mobile(899), release(56)];
+  const tv = await (await get(m, '/v1/updates/test/latest', { 'x-tester-key': KEY })).json();
+  assert.equal(tv.versionCode, 57);
+  assert.deepEqual(tv.previous.map((p) => p.versionCode), [56]);
+  const res = await get(m, '/v1/updates/mobile-test/latest', { 'x-tester-key': KEY });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.versionCode, 900);
+  assert.equal(body.versionName, '0.6.6-test.900');
+  assert.equal(body.apk.sha256, sha);
+  assert.equal(body.apk.url, 'https://sync.test/v1/updates/mobile-test/apk/900');
+  assert.deepEqual(body.previous.map((p) => p.versionCode), [899]);
+  const apk = await get(m, '/v1/updates/mobile-test/apk/899', { 'x-tester-key': KEY });
+  assert.equal(apk.status, 200);
+  assert.match(apk.headers.get('content-disposition'), /Mobile-Test-899\.apk/);
+  assert.equal((await get(m, '/v1/updates/mobile-test/apk/57', { 'x-tester-key': KEY })).status, 404, 'a TV build is not a phone build');
+  assert.equal((await get(m, '/v1/updates/test/apk/900', { 'x-tester-key': KEY })).status, 404);
+  assert.equal((await get(m, `/v1/updates/mobile-test/download?key=${KEY}`)).status, 200);
+  assert.equal((await get(m, '/v1/updates/mobile-test/latest')).status, 404, 'the key is needed here too');
+});
+
+await test('phone routes say "none" when there is no phone build yet', async (m) => {
+  const res = await get(m, '/v1/updates/mobile-test/latest', { 'x-tester-key': KEY });
+  assert.equal(res.status, 404);
+  assert.equal((await res.json()).error, 'none');
+});
+
 await test('a bad repo setting is refused', async () => {
   const m = make({ TEST_BUILDS_REPO: '../../etc' });
   assert.equal((await get(m, '/v1/updates/test/latest', { 'x-tester-key': KEY })).status, 503);

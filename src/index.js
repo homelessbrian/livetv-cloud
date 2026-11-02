@@ -15,6 +15,7 @@
 //   GET    /v1/updates/test/latest        what the newest test build is        200 | 404
 //   GET    /v1/updates/test/apk/<code>    that test build's APK                200 | 404
 //   GET    /v1/updates/test/download      the newest APK (first install)       200 | 404
+//   The same three exist under /v1/updates/mobile-test/ for the phone app's test builds.
 //
 // The saved setup (it holds IPTV logins and the parental PIN) is encrypted before it goes into the
 // database: AES-256-GCM, with a separate key per Nuvio account made from the secret
@@ -383,13 +384,13 @@ function testRepo(env) {
   return repo;
 }
 
-/** The test builds that exist, newest first (a minute of memory, so GitHub is not asked on every check). */
-async function testReleases(env) {
+/** Every test build that exists (TV and phone), newest first (a minute of memory, so GitHub is not asked on every check). */
+async function allTestReleases(env) {
   if (testListCache && testListCache.until > Date.now()) return testListCache.releases;
   if (!env.TEST_BUILDS_TOKEN) throw new HttpError(503, 'test_updates_not_set');
   let res;
   try {
-    res = await fetch(`${GITHUB_API}/repos/${testRepo(env)}/releases?per_page=15`, {
+    res = await fetch(`${GITHUB_API}/repos/${testRepo(env)}/releases?per_page=50`, {
       headers: githubHeaders(env),
       signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     });
@@ -404,9 +405,10 @@ async function testReleases(env) {
     throw new HttpError(503, 'github_unreachable');
   }
   const releases = (Array.isArray(list) ? list : [])
-    .filter((r) => r && !r.draft && /^test-\d{1,10}$/.test(r.tag_name || ''))
+    .filter((r) => r && !r.draft && /^(mobile-)?test-\d{1,10}$/.test(r.tag_name || ''))
     .map((r) => ({
-      versionCode: Number(r.tag_name.slice(5)),
+      mobile: r.tag_name.startsWith('mobile-'),
+      versionCode: Number(r.tag_name.slice(r.tag_name.lastIndexOf('-') + 1)),
       versionName: text(r.name, 80) || r.tag_name,
       notes: text(r.body, 4000),
       publishedAt: r.published_at || r.created_at || null,
@@ -418,7 +420,15 @@ async function testReleases(env) {
   return releases;
 }
 
-function testManifest(origin, releases) {
+/** The test builds of one app (the TV's or the phone's), newest first. */
+async function testReleases(env, mobile) {
+  const all = await allTestReleases(env);
+  return all
+    .filter((r) => r.mobile === mobile)
+    .map((r) => (mobile ? { ...r, versionName: r.versionName.replace(/^Mobile\s+/i, '') } : r));
+}
+
+function testManifest(origin, releases, route) {
   const [latest, ...older] = releases;
   const sha = /^sha256:([0-9a-f]{64})$/i.exec(latest.asset.digest || '');
   return {
@@ -431,12 +441,12 @@ function testManifest(origin, releases) {
       name: latest.asset.name,
       size: latest.asset.size ?? null,
       sha256: sha ? sha[1].toLowerCase() : null,
-      url: `${origin}/v1/updates/test/apk/${latest.versionCode}`,
+      url: `${origin}/v1/updates/${route}/apk/${latest.versionCode}`,
     },
     previous: older.slice(0, 4).map((r) => ({
       versionName: r.versionName,
       versionCode: r.versionCode,
-      url: `${origin}/v1/updates/test/apk/${r.versionCode}`,
+      url: `${origin}/v1/updates/${route}/apk/${r.versionCode}`,
     })),
   };
 }
@@ -476,17 +486,19 @@ async function testUpdates(request, env, pathname) {
   // Anyone without the key gets the same answer as for a page that doesn't exist.
   if (request.method !== 'GET' || !(await testerAllowed(request, env))) throw new HttpError(404, 'not_found');
   const path = pathname.replace(/\/+$/, '');
-  const releases = await testReleases(env);
+  const route = path.startsWith('/v1/updates/mobile-test/') ? 'mobile-test' : 'test';
+  const releases = await testReleases(env, route === 'mobile-test');
+  const base = `/v1/updates/${route}`;
 
-  if (path === '/v1/updates/test/latest') {
+  if (path === `${base}/latest`) {
     if (!releases.length) throw new HttpError(404, 'none');
-    return reply(200, testManifest(new URL(request.url).origin, releases));
+    return reply(200, testManifest(new URL(request.url).origin, releases, route));
   }
-  if (path === '/v1/updates/test/download') {
+  if (path === `${base}/download`) {
     if (!releases.length) throw new HttpError(404, 'none');
     return streamTestApk(env, releases[0]);
   }
-  const apk = /^\/v1\/updates\/test\/apk\/(\d{1,10})$/.exec(path);
+  const apk = new RegExp(`^${base}/apk/(\\d{1,10})$`).exec(path);
   if (apk) {
     const release = releases.find((r) => r.versionCode === Number(apk[1]));
     if (!release) throw new HttpError(404, 'none');
@@ -508,7 +520,7 @@ export default {
           testUpdates: testKeys(env).length > 0 && env.TEST_BUILDS_TOKEN ? 'ready' : 'not_set',
         });
       }
-      if (pathname.startsWith('/v1/updates/test/')) return await testUpdates(request, env, pathname);
+      if (pathname.startsWith('/v1/updates/test/') || pathname.startsWith('/v1/updates/mobile-test/')) return await testUpdates(request, env, pathname);
 
       const routes = {
         '/v1/setup': { GET: getSetup, PUT: (e, u) => putSetup(request, e, u), DELETE: deleteSetup },
