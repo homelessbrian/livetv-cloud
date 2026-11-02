@@ -127,8 +127,10 @@ await test('empty, oversized and broken saves are refused', async () => {
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: {} })).status, 422);
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2 })).status, 422);
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: [1] })).status, 422);
-  const big = { x: { t: 'str', v: 'y'.repeat(300 * 1024) } };
+  const big = { x: { t: 'str', v: 'y'.repeat(1200 * 1024) } };
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: big })).status, 413);
+  const noise = Array.from({ length: 900 * 1024 }, () => Math.random().toString(36)[2] ?? 'a').join('');
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: { x: { t: 'str', v: noise } } })).status, 413, 'too big even squeezed');
   const broken = await mf.dispatchFetch('https://sync.test/v1/setup', {
     method: 'PUT', headers: { authorization: `Bearer ${tokens.A}`, apikey: KEY }, body: '{nope',
   });
@@ -196,7 +198,7 @@ await test('what is stored is encrypted, not readable text', async () => {
   assert.equal((await call('PUT', '/v1/setup', 'D', { baseRevision: 1, data: secretSetup })).status, 200);
   const row = await rowOf(USERS.D);
   for (const stored of [row.data, row.prev_data]) {
-    assert.ok(stored.startsWith('enc1:'));
+    assert.ok(stored.startsWith('enc2:'));
     assert.ok(!stored.includes('hunter2') && !stored.includes('bob'));
   }
   assert.deepEqual((await json(await call('GET', '/v1/setup', 'D'))).data, secretSetup);
@@ -232,7 +234,7 @@ await test('an older readable copy is still read, and gets encrypted', async () 
     .bind(USERS.B, old, JSON.stringify(setup('older'))).run();
   assert.deepEqual((await json(await call('GET', '/v1/setup', 'B'))).data, setup('old'));
   const row = await rowOf(USERS.B);
-  assert.ok(row.data.startsWith('enc1:') && row.prev_data.startsWith('enc1:'));
+  assert.ok(row.data.startsWith('enc2:') && row.prev_data.startsWith('enc2:'));
   assert.equal(row.revision, 5);
   assert.deepEqual((await json(await call('GET', '/v1/setup/previous', 'B'))).data, setup('older'));
 });
@@ -243,7 +245,7 @@ await test('saving over an older readable copy encrypts the moved-aside copy too
   await db.prepare(`INSERT INTO setups (user_id, revision, data, saved_at) VALUES (?, 2, ?, 1)`).bind(USERS.B, JSON.stringify(setup('legacy'))).run();
   assert.equal((await call('PUT', '/v1/setup', 'B', { baseRevision: 2, data: setup('new') })).status, 200);
   const row = await rowOf(USERS.B);
-  assert.ok(row.data.startsWith('enc1:') && row.prev_data.startsWith('enc1:'));
+  assert.ok(row.data.startsWith('enc2:') && row.prev_data.startsWith('enc2:'));
   assert.deepEqual((await json(await call('GET', '/v1/setup/previous', 'B'))).data, setup('legacy'));
 });
 
@@ -291,6 +293,19 @@ await test('a different secret cannot read the copy', async () => {
   assert.equal(res.status, 503);
   assert.equal((await res.json()).error, 'cannot_decrypt');
   await m.dispose();
+});
+
+await test('a big but ordinary setup (600 KB of text) is squeezed, saved and read back', async () => {
+  const before = await json(await call('GET', '/v1/setup', 'A'));
+  const REV = before.revision;
+  const lots = { x: { t: 'str', v: Array.from({ length: 12000 }, (_, i) => `channel-${i}|Some Channel Name ${i}|group ${i % 40}`).join('\n') } };
+  assert.ok(JSON.stringify(lots).length > 500 * 1024);
+  const put = await call('PUT', '/v1/setup', 'A', { baseRevision: REV, data: lots });
+  assert.equal(put.status, 200);
+  assert.deepEqual((await json(await call('GET', '/v1/setup', 'A'))).data, lots);
+  assert.deepEqual((await json(await call('GET', '/v1/setup/previous', 'A'))).data, before.data);
+  // put it back so later tests see the revision they expect
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: REV + 1, data: before.data })).status, 200);
 });
 
 console.log(`\n${passed} tests passed`);

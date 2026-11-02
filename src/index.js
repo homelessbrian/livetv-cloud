@@ -25,7 +25,9 @@
 // A save carries the revision it was based on. If someone else saved in between, it is refused
 // with 409 and the current revision, so a TV that was offline can never overwrite newer work.
 
-const MAX_BODY_BYTES = 256 * 1024;
+const MAX_BODY_BYTES = 1024 * 1024;
+// A saved copy (squeezed, then encrypted) must stay small: the database row holds two copies and a row can be 2 MB.
+const MAX_STORED_CHARS = 700 * 1024;
 const SAVES_PER_DAY = 500;
 const TOKEN_CACHE_MS = 5 * 60 * 1000;
 const NUVIO_TIMEOUT_MS = 8000;
@@ -45,7 +47,8 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS setups (
   saves_count INTEGER NOT NULL DEFAULT 0
 )`;
 
-const ENC_PREFIX = 'enc1:';
+const ENC_PREFIX = 'enc1:'; // encrypted
+const ENC2_PREFIX = 'enc2:'; // squeezed (gzip), then encrypted
 const MIN_SECRET_LENGTH = 32;
 
 function toB64(bytes) {
@@ -70,32 +73,43 @@ async function accountKey(env, userId) {
   );
 }
 
-/** Text -> "enc1:<iv>:<encrypted>". The account id is bound in, so a row can't be moved to another account. */
+async function squeeze(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function unsqueeze(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/** Text -> "enc2:<iv>:<encrypted>" (squeezed first). The account id is bound in, so a row can't be moved to another account. */
 async function encryptText(env, userId, plain) {
   const key = await accountKey(env, userId);
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const sealed = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode(userId) },
     key,
-    new TextEncoder().encode(plain)
+    await squeeze(new TextEncoder().encode(plain))
   );
-  return `${ENC_PREFIX}${toB64(iv)}:${toB64(new Uint8Array(sealed))}`;
+  return `${ENC2_PREFIX}${toB64(iv)}:${toB64(new Uint8Array(sealed))}`;
 }
 
-const isEncrypted = (stored) => typeof stored === 'string' && stored.startsWith(ENC_PREFIX);
+const isEncrypted = (stored) => typeof stored === 'string' && (stored.startsWith(ENC_PREFIX) || stored.startsWith(ENC2_PREFIX));
 
 /** Back to text. A copy saved before encryption existed is returned as it is. */
 async function decryptText(env, userId, stored) {
   if (!isEncrypted(stored)) return stored;
   const key = await accountKey(env, userId);
   try {
+    const squeezed = stored.startsWith(ENC2_PREFIX);
     const [iv, sealed] = stored.slice(ENC_PREFIX.length).split(':');
     const plain = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv: fromB64(iv), additionalData: new TextEncoder().encode(userId) },
       key,
       fromB64(sealed)
     );
-    return new TextDecoder().decode(plain);
+    return new TextDecoder().decode(squeezed ? await unsqueeze(new Uint8Array(plain)) : plain);
   } catch {
     throw new HttpError(503, 'cannot_decrypt');
   }
@@ -262,6 +276,7 @@ async function putSetup(request, env, userId) {
   const now = Date.now();
   const today = new Date(now).toISOString().slice(0, 10);
   const encoded = await encryptText(env, userId, JSON.stringify(data));
+  if (encoded.length > MAX_STORED_CHARS) throw new HttpError(413, 'too_large');
 
   const row = await getRow(env, userId);
 
