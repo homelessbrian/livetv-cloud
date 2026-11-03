@@ -7,7 +7,7 @@ How it works:
 - The app sends the Nuvio access token it already has. The Worker asks Nuvio's sign-in server whose token it is (and remembers the answer for 5 minutes). The token is never stored, logged or refreshed.
 - One copy per Nuvio account is stored in a D1 database, plus the copy from before the last save.
 - A save says which revision it was based on. If another TV saved in between, it is refused (409), so an out-of-date TV can't overwrite newer settings.
-- Limits: 256 KB per copy, 500 saves per account per day. An empty setup is refused.
+- Limits: 5 MB of setup per save (stored squeezed and encrypted; each stored copy up to about 1.9 MB), the current and the earlier copy in separate rows, 500 saves per account per day. An empty setup is refused.
 
 ## Endpoints
 

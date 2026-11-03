@@ -127,9 +127,9 @@ await test('empty, oversized and broken saves are refused', async () => {
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: {} })).status, 422);
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2 })).status, 422);
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: [1] })).status, 422);
-  const big = { x: { t: 'str', v: 'y'.repeat(1200 * 1024) } };
+  const big = { x: { t: 'str', v: 'y'.repeat(5200 * 1024) } };
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: big })).status, 413);
-  const noise = Array.from({ length: 900 * 1024 }, () => Math.random().toString(36)[2] ?? 'a').join('');
+  const noise = Array.from({ length: 2600 * 1024 }, () => Math.random().toString(36)[2] ?? 'a').join('');
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: 2, data: { x: { t: 'str', v: noise } } })).status, 413, 'too big even squeezed');
   const broken = await mf.dispatchFetch('https://sync.test/v1/setup', {
     method: 'PUT', headers: { authorization: `Bearer ${tokens.A}`, apikey: KEY }, body: '{nope',
@@ -190,7 +190,13 @@ await test('daily save limit', async () => {
 
 // ---- encryption ----
 const dbOf = () => mf.getD1Database('DB');
-const rowOf = (id) => dbOf().then((db) => db.prepare('SELECT * FROM setups WHERE user_id = ?').bind(id).first());
+const rowOf = async (id) => {
+  const db = await dbOf();
+  const row = await db.prepare('SELECT * FROM setups WHERE user_id = ?').bind(id).first();
+  const moved = await db.prepare('SELECT * FROM setup_previous WHERE user_id = ?').bind(id).first();
+  // Where the earlier copy is now (its own row), or where older rows kept it.
+  return row && { ...row, prev_data: moved?.data ?? row.prev_data, legacy_prev: row.prev_data };
+};
 
 await test('what is stored is encrypted, not readable text', async () => {
   const secretSetup = { xtream: { t: 'str', v: 'http://host/get.php?username=bob&password=hunter2-PIN-4321' } };
@@ -243,6 +249,7 @@ await test('saving over an older readable copy encrypts the moved-aside copy too
   const db = await dbOf();
   await call('DELETE', '/v1/setup', 'B');
   await db.prepare(`INSERT INTO setups (user_id, revision, data, saved_at) VALUES (?, 2, ?, 1)`).bind(USERS.B, JSON.stringify(setup('legacy'))).run();
+  assert.equal(await db.prepare('SELECT COUNT(*) AS n FROM setup_previous WHERE user_id = ?').bind(USERS.B).first('n'), 0, 'delete clears the earlier copy too');
   assert.equal((await call('PUT', '/v1/setup', 'B', { baseRevision: 2, data: setup('new') })).status, 200);
   const row = await rowOf(USERS.B);
   assert.ok(row.data.startsWith('enc2:') && row.prev_data.startsWith('enc2:'));
@@ -306,6 +313,47 @@ await test('a big but ordinary setup (600 KB of text) is squeezed, saved and rea
   assert.deepEqual((await json(await call('GET', '/v1/setup/previous', 'A'))).data, before.data);
   // put it back so later tests see the revision they expect
   assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: REV + 1, data: before.data })).status, 200);
+});
+
+await test('a save moves the copy kept the old way (same row) into its own row', async () => {
+  const db = await dbOf();
+  await call('DELETE', '/v1/setup', 'C');
+  const r = await call('PUT', '/v1/setup', 'C', { baseRevision: 0, data: setup('c1') });
+  assert.equal(r.status, 200);
+  const cur = (await db.prepare('SELECT data FROM setups WHERE user_id = ?').bind(USERS.C).first()).data;
+  // Pretend this row was written by the old Worker: current + earlier copy in one row.
+  await db.prepare('UPDATE setups SET revision = 7, prev_revision = 6, prev_data = ?, prev_saved_at = 1 WHERE user_id = ?')
+    .bind(JSON.stringify(setup('c-old')), USERS.C).run();
+  assert.deepEqual((await json(await call('GET', '/v1/setup/previous', 'C'))).data, setup('c-old'), 'old-style earlier copy still read');
+  assert.equal((await call('PUT', '/v1/setup', 'C', { baseRevision: 7, data: setup('c2') })).status, 200);
+  const row = await db.prepare('SELECT * FROM setups WHERE user_id = ?').bind(USERS.C).first();
+  assert.equal(row.prev_data, null);
+  const moved = await db.prepare('SELECT * FROM setup_previous WHERE user_id = ?').bind(USERS.C).first();
+  assert.equal(moved.revision, 7);
+  assert.equal(moved.data, cur);
+  const prev = await json(await call('GET', '/v1/setup/previous', 'C'));
+  assert.equal(prev.revision, 7);
+  assert.equal(prev.currentRevision, 8);
+  assert.deepEqual(prev.data, setup('c1'));
+  // A stale save changes neither row.
+  assert.equal((await call('PUT', '/v1/setup', 'C', { baseRevision: 7, data: setup('stale') })).status, 409);
+  assert.equal((await db.prepare('SELECT revision FROM setup_previous WHERE user_id = ?').bind(USERS.C).first()).revision, 7);
+  assert.deepEqual((await json(await call('GET', '/v1/setup', 'C'))).data, setup('c2'));
+});
+
+await test('a very large setup (stored copy well over the old 700 KB) saves, and the earlier copy survives', async () => {
+  const before = await json(await call('GET', '/v1/setup', 'A'));
+  const REV = before.revision;
+  const noise = Array.from({ length: 1500 * 1024 }, () => Math.random().toString(36)[2] ?? 'a').join('');
+  const huge = { x: { t: 'str', v: noise } };
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: REV, data: huge })).status, 200);
+  const stored = (await rowOf(USERS.A)).data.length;
+  assert.ok(stored > 1000 * 1024, `stored copy is ${stored} chars`);
+  assert.deepEqual((await json(await call('GET', '/v1/setup', 'A'))).data, huge);
+  // Save again: both big copies are kept, each in its own row.
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: REV + 1, data: huge })).status, 200);
+  assert.deepEqual((await json(await call('GET', '/v1/setup/previous', 'A'))).data, huge);
+  assert.equal((await call('PUT', '/v1/setup', 'A', { baseRevision: REV + 2, data: before.data })).status, 200);
 });
 
 console.log(`\n${passed} tests passed`);

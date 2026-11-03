@@ -27,9 +27,10 @@
 // A save carries the revision it was based on. If someone else saved in between, it is refused
 // with 409 and the current revision, so a TV that was offline can never overwrite newer work.
 
-const MAX_BODY_BYTES = 1024 * 1024;
-// A saved copy (squeezed, then encrypted) must stay small: the database row holds two copies and a row can be 2 MB.
-const MAX_STORED_CHARS = 700 * 1024;
+const MAX_BODY_BYTES = 5 * 1024 * 1024;
+// A saved copy (squeezed, then encrypted) must fit in one database row, which can be 2 MB. The
+// copy from before the last save has its own row (setup_previous), so each copy gets the full room.
+const MAX_STORED_CHARS = 1_900_000;
 const SAVES_PER_DAY = 500;
 const TOKEN_CACHE_MS = 5 * 60 * 1000;
 const NUVIO_TIMEOUT_MS = 8000;
@@ -47,6 +48,15 @@ const SCHEMA = `CREATE TABLE IF NOT EXISTS setups (
   prev_saved_at INTEGER,
   saves_day TEXT NOT NULL DEFAULT '',
   saves_count INTEGER NOT NULL DEFAULT 0
+)`;
+
+// The copy from before the last save. Older rows may still hold it in setups.prev_*; it is read
+// from there until the next save moves it here.
+const SCHEMA_PREVIOUS = `CREATE TABLE IF NOT EXISTS setup_previous (
+  user_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL,
+  data TEXT NOT NULL,
+  saved_at INTEGER NOT NULL
 )`;
 
 const ENC_PREFIX = 'enc1:'; // encrypted
@@ -168,7 +178,7 @@ function tokenExpiry(token) {
 
 function ensureSchema(env) {
   if (!schemaReady) {
-    schemaReady = env.DB.prepare(SCHEMA).run().catch((err) => {
+    schemaReady = env.DB.batch([env.DB.prepare(SCHEMA), env.DB.prepare(SCHEMA_PREVIOUS)]).catch((err) => {
       schemaReady = null;
       throw err;
     });
@@ -255,7 +265,17 @@ async function getSetup(env, userId) {
 
 async function getPrevious(env, userId) {
   const row = await getRow(env, userId);
-  if (!row || !row.prev_data) throw new HttpError(404, 'none');
+  if (!row) throw new HttpError(404, 'none');
+  const moved = await env.DB.prepare('SELECT * FROM setup_previous WHERE user_id = ?').bind(userId).first();
+  if (moved) {
+    return reply(200, {
+      revision: moved.revision,
+      savedAt: moved.saved_at,
+      currentRevision: row.revision,
+      data: JSON.parse(await decryptText(env, userId, moved.data)),
+    });
+  }
+  if (!row.prev_data) throw new HttpError(404, 'none');
   const data = JSON.parse(await decryptText(env, userId, row.prev_data));
   await upgradeRow(env, userId, row);
   return reply(200, {
@@ -307,14 +327,21 @@ async function putSetup(request, env, userId) {
   // The copy being replaced moves aside (encrypted, if it still was readable text).
   const previous = isEncrypted(row.data) ? row.data : await encryptText(env, userId, row.data);
 
-  // The previous copy moves aside, and the save only goes through if nobody saved in between.
-  const saved = await env.DB.prepare(
-    `UPDATE setups SET
-       prev_revision = revision, prev_data = ?, prev_saved_at = saved_at,
-       revision = revision + 1, data = ?, saved_at = ?, device = ?, device_id = ?,
-       saves_count = CASE WHEN saves_day = ? THEN saves_count + 1 ELSE 1 END, saves_day = ?
-     WHERE user_id = ? AND revision = ?`
-  ).bind(previous, encoded, now, device, deviceId, today, today, userId, row.revision).run();
+  // The save only goes through if nobody saved in between; then (in the same transaction) the
+  // replaced copy moves to its own row. Any copy still kept in this row the old way is cleared.
+  const [saved] = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE setups SET
+         prev_revision = NULL, prev_data = NULL, prev_saved_at = NULL,
+         revision = revision + 1, data = ?, saved_at = ?, device = ?, device_id = ?,
+         saves_count = CASE WHEN saves_day = ? THEN saves_count + 1 ELSE 1 END, saves_day = ?
+       WHERE user_id = ? AND revision = ?`
+    ).bind(encoded, now, device, deviceId, today, today, userId, row.revision),
+    env.DB.prepare(
+      `INSERT OR REPLACE INTO setup_previous (user_id, revision, data, saved_at)
+       SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM setups WHERE user_id = ? AND revision = ? AND saved_at = ? AND device_id = ?)`
+    ).bind(userId, row.revision, previous, row.saved_at, userId, row.revision + 1, now, deviceId),
+  ]);
   if (!saved.meta.changes) {
     const current = await getRow(env, userId);
     throw new HttpError(409, 'conflict', { revision: current?.revision ?? 0, savedAt: current?.saved_at, device: current?.device });
@@ -323,7 +350,10 @@ async function putSetup(request, env, userId) {
 }
 
 async function deleteSetup(env, userId) {
-  await env.DB.prepare('DELETE FROM setups WHERE user_id = ?').bind(userId).run();
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM setups WHERE user_id = ?').bind(userId),
+    env.DB.prepare('DELETE FROM setup_previous WHERE user_id = ?').bind(userId),
+  ]);
   return reply(200, { ok: true });
 }
 
