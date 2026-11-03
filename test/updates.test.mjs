@@ -219,6 +219,23 @@ await test('phone test builds have their own list and never mix with the TV ones
   assert.equal((await get(m, '/v1/updates/mobile-test/latest')).status, 404, 'the key is needed here too');
 });
 
+await test('release-check builds have their own list and never reach the test apps', async (m) => {
+  const check = (code) => release(code, {
+    tag_name: `release-check-${code}`,
+    name: `1.1.0-beta.9.${code - 107200}`,
+    assets: [{ id: code * 10, name: `NuvioPlusIPTV-check-${code}.apk`, size: APK_BYTES.length, state: 'uploaded', digest: `sha256:${sha}` }],
+  });
+  releases = [check(107203), release(57)];
+  const tv = await (await get(m, '/v1/updates/test/latest', { 'x-tester-key': KEY })).json();
+  assert.equal(tv.versionCode, 57, 'the test app is never offered a release check');
+  const body = await (await get(m, '/v1/updates/release-check/latest', { 'x-tester-key': KEY })).json();
+  assert.equal(body.versionCode, 107203);
+  assert.equal(body.channel, 'release-check');
+  assert.equal((await get(m, `/v1/updates/release-check/download?key=${KEY}`)).status, 200);
+  assert.equal((await get(m, '/v1/updates/release-check/download')).status, 404, 'the key is needed');
+  assert.equal((await get(m, '/v1/updates/nothing-here/latest', { 'x-tester-key': KEY })).status, 404);
+});
+
 await test('phone routes say "none" when there is no phone build yet', async (m) => {
   const res = await get(m, '/v1/updates/mobile-test/latest', { 'x-tester-key': KEY });
   assert.equal(res.status, 404);

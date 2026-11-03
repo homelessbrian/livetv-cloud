@@ -15,7 +15,8 @@
 //   GET    /v1/updates/test/latest        what the newest test build is        200 | 404
 //   GET    /v1/updates/test/apk/<code>    that test build's APK                200 | 404
 //   GET    /v1/updates/test/download      the newest APK (first install)       200 | 404
-//   The same three exist under /v1/updates/mobile-test/ for the phone app's test builds.
+//   The same three exist under /v1/updates/mobile-test/ for the phone app's test builds, and under
+//   /v1/updates/release-check/ for a TV release build checked privately before it goes to users.
 //
 // The saved setup (it holds IPTV logins and the parental PIN) is encrypted before it goes into the
 // database: AES-256-GCM, with a separate key per Nuvio account made from the secret
@@ -384,7 +385,11 @@ function testRepo(env) {
   return repo;
 }
 
-/** Every test build that exists (TV and phone), newest first (a minute of memory, so GitHub is not asked on every check). */
+// Which build a GitHub tag belongs to: test-<code> (TV test app), mobile-test-<code> (phone test
+// app), release-check-<code> (the TV app as users get it, built for a private check first).
+const BUILD_KINDS = { test: 'test', 'mobile-test': 'mobile-test', 'release-check': 'release-check' };
+
+/** Every private build that exists (TV, phone and release checks), newest first (a minute of memory, so GitHub is not asked on every check). */
 async function allTestReleases(env) {
   if (testListCache && testListCache.until > Date.now()) return testListCache.releases;
   if (!env.TEST_BUILDS_TOKEN) throw new HttpError(503, 'test_updates_not_set');
@@ -405,9 +410,9 @@ async function allTestReleases(env) {
     throw new HttpError(503, 'github_unreachable');
   }
   const releases = (Array.isArray(list) ? list : [])
-    .filter((r) => r && !r.draft && /^(mobile-)?test-\d{1,10}$/.test(r.tag_name || ''))
+    .filter((r) => r && !r.draft && /^(mobile-test|test|release-check)-\d{1,10}$/.test(r.tag_name || ''))
     .map((r) => ({
-      mobile: r.tag_name.startsWith('mobile-'),
+      kind: r.tag_name.slice(0, r.tag_name.lastIndexOf('-')),
       versionCode: Number(r.tag_name.slice(r.tag_name.lastIndexOf('-') + 1)),
       versionName: text(r.name, 80) || r.tag_name,
       notes: text(r.body, 4000),
@@ -420,19 +425,19 @@ async function allTestReleases(env) {
   return releases;
 }
 
-/** The test builds of one app (the TV's or the phone's), newest first. */
-async function testReleases(env, mobile) {
+/** The builds of one kind (see BUILD_KINDS), newest first. */
+async function testReleases(env, kind) {
   const all = await allTestReleases(env);
   return all
-    .filter((r) => r.mobile === mobile)
-    .map((r) => (mobile ? { ...r, versionName: r.versionName.replace(/^Mobile\s+/i, '') } : r));
+    .filter((r) => r.kind === kind)
+    .map((r) => (kind === 'mobile-test' ? { ...r, versionName: r.versionName.replace(/^Mobile\s+/i, '') } : r));
 }
 
 function testManifest(origin, releases, route) {
   const [latest, ...older] = releases;
   const sha = /^sha256:([0-9a-f]{64})$/i.exec(latest.asset.digest || '');
   return {
-    channel: 'test',
+    channel: route === 'release-check' ? 'release-check' : 'test',
     versionName: latest.versionName,
     versionCode: latest.versionCode,
     publishedAt: latest.publishedAt,
@@ -486,8 +491,9 @@ async function testUpdates(request, env, pathname) {
   // Anyone without the key gets the same answer as for a page that doesn't exist.
   if (request.method !== 'GET' || !(await testerAllowed(request, env))) throw new HttpError(404, 'not_found');
   const path = pathname.replace(/\/+$/, '');
-  const route = path.startsWith('/v1/updates/mobile-test/') ? 'mobile-test' : 'test';
-  const releases = await testReleases(env, route === 'mobile-test');
+  const route = BUILD_KINDS[path.split('/')[3]];
+  if (!route) throw new HttpError(404, 'not_found');
+  const releases = await testReleases(env, route);
   const base = `/v1/updates/${route}`;
 
   if (path === `${base}/latest`) {
@@ -520,7 +526,7 @@ export default {
           testUpdates: testKeys(env).length > 0 && env.TEST_BUILDS_TOKEN ? 'ready' : 'not_set',
         });
       }
-      if (pathname.startsWith('/v1/updates/test/') || pathname.startsWith('/v1/updates/mobile-test/')) return await testUpdates(request, env, pathname);
+      if (Object.keys(BUILD_KINDS).some((k) => pathname.startsWith(`/v1/updates/${k}/`))) return await testUpdates(request, env, pathname);
 
       const routes = {
         '/v1/setup': { GET: getSetup, PUT: (e, u) => putSetup(request, e, u), DELETE: deleteSetup },
