@@ -35,6 +35,12 @@ The key goes in an `X-Tester-Key` header (or `?key=`). Releases must be tagged `
 
 Secrets (Settings → Variables and secrets): `TESTER_KEY` (16+ characters; several allowed, separated by commas) and `TEST_BUILDS_TOKEN` (a GitHub token that can only read the private repo's contents). Optional: `TEST_BUILDS_REPO`, default `homelessbrian/Nuvio_Testing`. Until both secrets are set these routes answer 404/503 and `/v1/health` shows `testUpdates: not_set`.
 
+## ESPN timer
+
+GitHub often skips nuvio-data's own 5-minute schedule for hours, so this Worker starts the "ESPN shared schedule cache" job itself every 5 minutes (cron in `wrangler.toml`).
+
+Secret: `ESPN_TRIGGER_TOKEN`, a fine-grained GitHub token for `homelessbrian/nuvio-data` only, with **Actions: Read and write**. Until it is set nothing happens and `/v1/health` shows `espnTimer: not_set`.
+
 ## Settings (optional)
 
 - `NUVIO_API_URL`: Nuvio's server, default `https://api.nuvio.tv`.

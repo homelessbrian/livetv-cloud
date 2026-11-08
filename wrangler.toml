@@ -7,3 +7,7 @@ compatibility_date = "2025-06-01"
 binding = "DB"
 database_name = "livetv-sync"
 database_id = "c7afd7cb-2b57-48f7-b39c-789c4faead22"
+
+# Every 5 minutes: start nuvio-data's ESPN score job (see "ESPN timer" in README.md).
+[triggers]
+crons = ["*/5 * * * *"]

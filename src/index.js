@@ -11,6 +11,11 @@
 //   GET    /v1/setup/previous  the copy from before the last save  200 | 404
 //   GET    /v1/health          is the service up                   200
 //
+// Every 5 minutes (the cron in wrangler.toml) it also asks GitHub to run nuvio-data's "ESPN shared
+// schedule cache" job, because GitHub's own schedule for it is often skipped for hours. Needs the
+// secret ESPN_TRIGGER_TOKEN (a GitHub token that may only run Actions in nuvio-data); without it
+// nothing happens.
+//
 // Private test builds (people with the tester key only; see the "Test builds" part below):
 //   GET    /v1/updates/test/latest        what the newest test build is        200 | 404
 //   GET    /v1/updates/test/apk/<code>    that test build's APK                200 | 404
@@ -543,7 +548,39 @@ async function testUpdates(request, env, pathname) {
   throw new HttpError(404, 'not_found');
 }
 
+// The ESPN score job in nuvio-data, started from the cron below.
+const ESPN_JOB = 'repos/homelessbrian/nuvio-data/actions/workflows/espn-schedule.yml/dispatches';
+
+/** Asks GitHub to run the ESPN score job now. Returns GitHub's status code, or 0 if it was not asked. */
+async function startEspnJob(env) {
+  const token = typeof env.ESPN_TRIGGER_TOKEN === 'string' ? env.ESPN_TRIGGER_TOKEN.trim() : '';
+  if (!token) return 0;
+  try {
+    const res = await fetch(`${GITHUB_API}/${ESPN_JOB}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: 'application/vnd.github+json',
+        'content-type': 'application/json',
+        'user-agent': 'livetv-cloud',
+        'x-github-api-version': '2022-11-28',
+      },
+      body: JSON.stringify({ ref: 'main' }),
+      signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+    });
+    if (res.status !== 204) console.log(`ESPN job not started: GitHub answered ${res.status}`);
+    return res.status;
+  } catch {
+    console.log('ESPN job not started: GitHub unreachable');
+    return -1;
+  }
+}
+
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(startEspnJob(env));
+  },
+
   async fetch(request, env) {
     try {
       const { pathname } = new URL(request.url);
@@ -554,6 +591,7 @@ export default {
           ok: true,
           encryption: secret.length >= MIN_SECRET_LENGTH ? 'ready' : secret ? 'secret_too_short' : 'secret_missing',
           testUpdates: testKeys(env).length > 0 && env.TEST_BUILDS_TOKEN ? 'ready' : 'not_set',
+          espnTimer: env.ESPN_TRIGGER_TOKEN ? 'ready' : 'not_set',
         });
       }
       if (Object.keys(BUILD_KINDS).some((k) => pathname.startsWith(`/v1/updates/${k}/`))) return await testUpdates(request, env, pathname);
