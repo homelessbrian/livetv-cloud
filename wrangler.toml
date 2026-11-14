@@ -8,6 +8,11 @@ binding = "DB"
 database_name = "livetv-sync"
 database_id = "c7afd7cb-2b57-48f7-b39c-789c4faead22"
 
+# The sports data files (filled by the nuvio-data job; handed out at /v2/data/ to our apps only).
+[[r2_buckets]]
+binding = "DATA"
+bucket_name = "nuvio-sports"
+
 # Every 5 minutes: start nuvio-data's ESPN score job (see "ESPN timer" in README.md).
 [triggers]
 crons = ["*/5 * * * *"]
