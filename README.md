@@ -44,14 +44,17 @@ The key goes in an `X-Tester-Key` header (or `?key=`). Releases must be tagged `
 
 Secrets (Settings → Variables and secrets): `TESTER_KEY` (16+ characters; several allowed, separated by commas) and `TEST_BUILDS_TOKEN` (a GitHub token that can only read the private repo's contents). Optional: `TEST_BUILDS_REPO`, default `homelessbrian/Nuvio_Testing`. Until both secrets are set these routes answer 404/503 and `/v1/health` shows `testUpdates: not_set`.
 
-## ESPN timer
+## ESPN scores (every 5 minutes)
 
-GitHub often skips nuvio-data's own 5-minute schedule for hours, so this Worker starts the "ESPN shared schedule cache" job itself every 5 minutes (cron in `wrangler.toml`).
+The cron in `wrangler.toml` runs an ESPN round: it asks ESPN for yesterday to a week ahead for every league in nuvio-data's `espn-leagues.txt` (same timing as nuvio-data's old `scripts/espn.py`) and saves the answers straight to the R2 bucket (`espn/<league>.json`). A league's file is saved only when one of its days really changed, or when its saved time gets old (15 min for today, 1 h for yesterday/tomorrow, 4 h further ahead). When each day was last asked for, and how the last round went, is kept in `espn/_state.json`. `/v1/health` shows the last round under `espnFetch`.
 
-Secret: `ESPN_TRIGGER_TOKEN`, a fine-grained GitHub token for `homelessbrian/nuvio-data` only, with **Actions: Read and write**. Until it is set nothing happens and `/v1/health` shows `espnTimer: not_set`.
+Then it starts nuvio-data's "ESPN shared schedule cache" job (GitHub often skips that job's own schedule for hours), which gets these files, makes the ready-made ones and keeps copies in that repo. If the Worker's last round is missing, over 15 minutes old or went badly (half the questions unanswered), that job asks ESPN itself as before.
+
+Secret: `ESPN_TRIGGER_TOKEN`, a fine-grained GitHub token for `homelessbrian/nuvio-data` only, with **Actions: Read and write**. Until it is set the job isn't started and `/v1/health` shows `espnTimer: not_set`.
 
 ## Settings (optional)
 
+- `ESPN_FETCH`: `off` stops the Worker's own ESPN rounds (the nuvio-data job then asks ESPN itself).
 - `DATA_CACHE_SECONDS`: how long each sports file is kept before R2 is read again, default 60 (0 = read R2 every time). Copies are kept in the Worker's memory and in Cloudflare's cache; the `x-data-from` header on each answer says which one answered (`memory`, `cache` or `r2`).
 
 - `NUVIO_API_URL`: Nuvio's server, default `https://api.nuvio.tv`.
@@ -59,4 +62,4 @@ Secret: `ESPN_TRIGGER_TOKEN`, a fine-grained GitHub token for `homelessbrian/nuv
 
 ## Tests
 
-`npm i --no-save miniflare && node test/worker.test.mjs && node test/updates.test.mjs && node test/v2.test.mjs`
+`npm i --no-save miniflare && node test/worker.test.mjs && node test/updates.test.mjs && node test/v2.test.mjs && node test/espn.test.mjs`

@@ -17,10 +17,11 @@
 //
 //   GET    /v2/data/<file>     a sports data file (app key only)   200 | 304 | 404
 //
-// Every 5 minutes (the cron in wrangler.toml) it also asks GitHub to run nuvio-data's "ESPN shared
-// schedule cache" job, because GitHub's own schedule for it is often skipped for hours. Needs the
-// secret ESPN_TRIGGER_TOKEN (a GitHub token that may only run Actions in nuvio-data); without it
-// nothing happens.
+// Every 5 minutes (the cron in wrangler.toml) it asks ESPN for the scores itself and saves them to
+// the R2 bucket (see "ESPN scores" below), then asks GitHub to run nuvio-data's "ESPN shared
+// schedule cache" job, which makes the ready-made files from them (GitHub's own schedule for it is
+// often skipped for hours). Starting the job needs the secret ESPN_TRIGGER_TOKEN (a GitHub token
+// that may only run Actions in nuvio-data).
 //
 // Private test builds (people with the tester key only; see the "Test builds" part below):
 //   GET    /v1/updates/test/latest        what the newest test build is        200 | 404
@@ -778,9 +779,221 @@ async function startEspnJob(env) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// ESPN scores, fetched here (every 5 minutes, the cron) and saved straight to the R2 bucket.
+// Same files and the same timing as nuvio-data's scripts/espn.py, which this replaces; the
+// nuvio-data job still makes the ready-made files from them (started right after this run).
+//
+// A league's file is saved only when one of its days really changed (ESPN's answer is the same
+// text most of the time; only the "fetched at" time moved, and saving that every run was most
+// of the R2 bill), or when its saved time is getting old. When each day was last asked for is
+// kept in one small file, espn/_state.json, which the nuvio-data job reads too.
+//
+// Setting ESPN_FETCH = "off" turns this off; the nuvio-data job then asks ESPN itself again,
+// as it also does by itself whenever this hasn't finished a good run in the last 15 minutes.
+// ---------------------------------------------------------------------------------------------
+
+const ESPN_API = 'https://site.api.espn.com/apis/site/v2/sports/';
+const ESPN_LEAGUES_URL = 'https://raw.githubusercontent.com/homelessbrian/nuvio-data/main/espn-leagues.txt';
+const ESPN_STATE = 'espn/_state.json';
+const ESPN_SOURCE = 'ESPN (site.api.espn.com), unofficial';
+const MIN = 60_000;
+// How long a day may go before ESPN is asked again (as in espn.py).
+const ESPN_TTL = { live: 1.5 * MIN, today: 8 * MIN, edge: 45 * MIN, far: 5 * 60 * MIN };
+// Unchanged days are saved again once their saved time is this old, so a copy read straight
+// from the file (older apps) never looks out of date (the app allows 20 min / 90 min / 6 h).
+const ESPN_RESAVE = { today: 15 * MIN, edge: 60 * MIN, far: 4 * 60 * MIN };
+const ESPN_BUDGET_MS = 9 * MIN;
+const ESPN_PARALLEL = 6;
+const ESPN_UA = 'Mozilla/5.0 (Linux; Android 12; TV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
+
+function parseEspnLeagues(text) {
+  const out = [];
+  for (const raw of String(text).split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const parts = line.split('|');
+    if (parts.length < 2) continue;
+    const id = parts[0].trim();
+    const path = parts[1].trim();
+    if (id && path) out.push({ id, path, query: (parts[2] || '').trim() });
+  }
+  return out;
+}
+
+const espnSafe = (id) => id.replace(/[^a-zA-Z0-9]+/g, '_');
+
+/** Yesterday to a week ahead as yyyyMMdd in US Eastern (the days ESPN groups games by), with what kind of day each is. */
+function espnDays(now) {
+  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit' });
+  const out = [];
+  for (let d = -1; d <= 7; d++) {
+    const day = fmt.format(new Date(now + d * 86_400_000)).replace(/-/g, '');
+    if (!out.some((o) => o.day === day)) out.push({ day, kind: d === 0 ? 'today' : d === -1 || d === 1 ? 'edge' : 'far' });
+  }
+  return out;
+}
+
+/** Is anything live, or starting within 30 minutes? (A quick look; the app does the real reading.) */
+function liveOrSoon(raw, now) {
+  if (!raw) return false;
+  if (/"state"\s*:\s*"in"/.test(raw)) return true;
+  for (const m of raw.matchAll(/"date"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\dZ)"/g)) {
+    const start = Date.parse(m[1]);
+    if (start - now >= 0 && start - now <= 30 * MIN) return true;
+  }
+  return false;
+}
+
+async function espnHash(text) {
+  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].slice(0, 10).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function espnDue(info, kind, now) {
+  if (!info) return true;
+  const age = now - (info.at || 0);
+  if (info.live) return age > ESPN_TTL.live;
+  return age > ESPN_TTL[kind];
+}
+
+async function espnGet(url) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { 'user-agent': ESPN_UA, accept: 'application/json' }, signal: AbortSignal.timeout(20_000) });
+      if (res.ok) return await res.text();
+      await res.body?.cancel();
+      if (res.status !== 429 && res.status < 500) return null; // an unknown league path: asking again won't help
+    } catch {
+      // timed out or unreachable: try again
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+  return null;
+}
+
+async function readJson(env, key) {
+  try {
+    const obj = await env.DATA.get(key);
+    return obj ? await obj.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * One ESPN round. Returns what it did ({ asked, failed, written, skipped }), or null when it
+ * didn't run (turned off, no bucket, another round still going, league list unreachable).
+ */
+async function runEspn(env, now = Date.now(), fetchLeagues = null) {
+  if (!env.DATA || String(env.ESPN_FETCH || '').trim().toLowerCase() === 'off') return null;
+  const started = Date.now();
+  const state = (await readJson(env, ESPN_STATE)) || {};
+  if (state.v !== 1) Object.assign(state, { v: 1, leagues: {} });
+  state.leagues ||= {};
+  if (state.runningSince && now - state.runningSince < ESPN_BUDGET_MS + MIN) return null;
+
+  let leagues;
+  try {
+    const text = fetchLeagues ? await fetchLeagues() : await (async () => {
+      const res = await fetch(ESPN_LEAGUES_URL, { headers: { 'user-agent': 'livetv-cloud' }, signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) throw new Error(String(res.status));
+      return res.text();
+    })();
+    leagues = parseEspnLeagues(text);
+  } catch {
+    leagues = [];
+  }
+  if (!leagues.length) return null;
+
+  state.runningSince = now;
+  await env.DATA.put(ESPN_STATE, JSON.stringify(state), { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+
+  const days = espnDays(now);
+  const oldest = days[0].day;
+  const stats = { asked: 0, failed: 0, written: 0, skipped: 0 };
+  const queue = [...leagues];
+
+  const doLeague = async (lg) => {
+    const ls = (state.leagues[lg.id] ||= { days: {} });
+    ls.days ||= {};
+    for (const d of Object.keys(ls.days)) if (d < oldest) delete ls.days[d];
+    const fresh = {};
+    let changed = false;
+    for (const { day, kind } of days) {
+      const info = ls.days[day];
+      if (!espnDue(info, kind, now)) continue;
+      if (Date.now() - started > ESPN_BUDGET_MS) { stats.skipped++; return; }
+      stats.asked++;
+      const raw = await espnGet(`${ESPN_API}${lg.path}/scoreboard?dates=${day}&limit=1000${lg.query}`);
+      if (raw === null) { stats.failed++; continue; }
+      const h = await espnHash(raw);
+      const live = liveOrSoon(raw, now);
+      const old = info || {};
+      const resave = now - (old.w || 0) > ESPN_RESAVE[kind];
+      if (h !== old.h || resave || !!old.live !== live) changed = true;
+      fresh[day] = raw;
+      ls.days[day] = { at: now, live, h, w: old.w || 0 };
+    }
+    if (!changed) return;
+    // Something to save: the file keeps the days not asked for this time as they were.
+    const key = `espn/${espnSafe(lg.id)}.json`;
+    const file = (await readJson(env, key)) || {};
+    const out = {};
+    for (const [d, v] of Object.entries(file.days || {})) if (d >= oldest) out[d] = v;
+    for (const [d, raw] of Object.entries(fresh)) {
+      out[d] = { fetchedAt: now, raw, liveOrSoon: ls.days[d].live };
+      ls.days[d].w = now;
+    }
+    const text = JSON.stringify({ source: ESPN_SOURCE, id: lg.id, days: out }) + '\n';
+    try {
+      await env.DATA.put(key, text, { httpMetadata: { contentType: 'application/json; charset=utf-8', cacheControl: 'no-cache' } });
+      stats.written++;
+    } catch {
+      // Not saved: ask again next round.
+      for (const d of Object.keys(fresh)) ls.days[d].w = 0, (ls.days[d].h = '');
+    }
+  };
+
+  await Promise.all(Array.from({ length: ESPN_PARALLEL }, async () => {
+    while (queue.length) {
+      const lg = queue.shift();
+      try {
+        await doLeague(lg);
+      } catch (e) {
+        console.log(`ESPN ${lg.id}: ${e?.message || e}`);
+      }
+    }
+  }));
+
+  // Leagues taken off the list are forgotten.
+  const ids = new Set(leagues.map((l) => l.id));
+  for (const id of Object.keys(state.leagues)) if (!ids.has(id)) delete state.leagues[id];
+  delete state.runningSince;
+  const ok = stats.asked === 0 || stats.failed / stats.asked < 0.5;
+  state.lastRun = { at: now, tookMs: Date.now() - started, ok, ...stats };
+  await env.DATA.put(ESPN_STATE, JSON.stringify(state), { httpMetadata: { contentType: 'application/json; charset=utf-8' } });
+  console.log(`ESPN: ${stats.asked} asked, ${stats.failed} failed, ${stats.written} files saved, ${stats.skipped} put off`);
+  return stats;
+}
+
+async function espnStatus(env) {
+  if (String(env.ESPN_FETCH || '').trim().toLowerCase() === 'off') return 'off';
+  if (!env.DATA) return 'not_set';
+  const state = await readJson(env, ESPN_STATE);
+  const r = state?.lastRun;
+  if (!r) return 'no_run_yet';
+  return { at: new Date(r.at).toISOString(), ok: r.ok, asked: r.asked, failed: r.failed, saved: r.written, tookSeconds: Math.round(r.tookMs / 1000) };
+}
+
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(startEspnJob(env));
+    // ESPN first, then the nuvio-data job (it makes the ready-made files from what was saved).
+    ctx.waitUntil(
+      runEspn(env)
+        .catch((e) => console.log(`ESPN round failed: ${e?.message || e}`))
+        .then(() => startEspnJob(env)),
+    );
   },
 
   async fetch(request, env, ctx) {
@@ -797,6 +1010,7 @@ export default {
           appKey: appKeys(env).length ? 'ready' : env.APP_KEY ? 'key_too_short' : 'not_set',
           sportsData: env.DATA ? 'ready' : 'not_set',
           dataCacheSeconds: cacheSeconds(env),
+          espnFetch: await espnStatus(env),
           oldDoor: oldDoorClosesAt(env) === null ? 'open' : oldDoorClosed(env) ? 'closed' : `closes ${new Date(oldDoorClosesAt(env)).toISOString().slice(0, 10)}`,
         });
       }
