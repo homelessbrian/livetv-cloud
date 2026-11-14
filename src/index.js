@@ -606,27 +606,148 @@ function dataType(name) {
   return 'application/octet-stream';
 }
 
-async function getData(request, env, file) {
+// Every app asks for the same few files, so each copy is kept for a short while (default 60
+// seconds, setting DATA_CACHE_SECONDS; 0 = off) instead of reading R2 on every request:
+//   1. in this Worker's own memory (files up to 1 MB, 32 MB in all), then
+//   2. in Cloudflare's cache for this location,
+//   3. and only then from R2.
+// The app keeps its own "has this changed?" check, answered from whichever copy is used.
+// The files change at most every few minutes and the app accepts copies up to 20 minutes old.
+// The response header x-data-from says which one answered (memory, cache or r2).
+
+const MEMO_MAX_FILE = 1_000_000;
+const MEMO_MAX_TOTAL = 32_000_000;
+const memo = new Map(); // file -> { until, missing, etag, modified, bytes }
+let memoBytes = 0;
+
+function cacheSeconds(env) {
+  const raw = String(env.DATA_CACHE_SECONDS ?? '').trim();
+  const n = raw === '' ? 60 : Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 600) : 0;
+}
+
+function memoGet(file, now) {
+  const e = memo.get(file);
+  if (!e) return null;
+  if (e.until > now) return e;
+  memoDrop(file);
+  return null;
+}
+
+function memoDrop(file) {
+  const e = memo.get(file);
+  if (!e) return;
+  memo.delete(file);
+  memoBytes -= e.bytes ? e.bytes.byteLength : 0;
+}
+
+function memoPut(file, entry) {
+  const size = entry.bytes ? entry.bytes.byteLength : 0;
+  if (size > MEMO_MAX_FILE) return;
+  memoDrop(file);
+  // Oldest first (a Map keeps the order things were added).
+  for (const key of memo.keys()) {
+    if (memoBytes + size <= MEMO_MAX_TOTAL && memo.size < 5000) break;
+    memoDrop(key);
+  }
+  memo.set(file, entry);
+  memoBytes += size;
+}
+
+/** Does the caller's If-None-Match match this copy? */
+function stillCurrent(request, etag) {
+  const wanted = request.headers.get('if-none-match');
+  if (!wanted || !etag) return false;
+  const bare = (t) => t.trim().replace(/^W\//, '');
+  return wanted.split(',').some((t) => t.trim() === '*' || bare(t) === bare(etag));
+}
+
+function dataReply(request, file, { etag, modified, body }, from) {
+  const headers = { 'content-type': dataType(file), 'cache-control': 'no-cache', 'x-data-from': from };
+  if (etag) headers.etag = etag;
+  if (modified) headers['last-modified'] = modified;
+  if (stillCurrent(request, etag)) return new Response(null, { status: 304, headers });
+  if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
+  return new Response(body, { status: 200, headers });
+}
+
+async function getData(request, env, file, ctx) {
   if (request.method !== 'GET' && request.method !== 'HEAD') throw new HttpError(405, 'method_not_allowed');
   if (!DATA_PATH.test(file) || file.includes('..')) throw new HttpError(404, 'not_found');
   if (!env.DATA) throw new HttpError(503, 'data_not_set');
+  const keep = cacheSeconds(env);
+  const now = Date.now();
+
+  // 1. This Worker's memory.
+  if (keep) {
+    const e = memoGet(file, now);
+    if (e?.missing) throw new HttpError(404, 'not_found');
+    if (e) return dataReply(request, file, { etag: e.etag, modified: e.modified, body: e.bytes }, 'memory');
+  }
+
+  // 2. Cloudflare's cache (the key has no app key or other headers in it).
+  const cache = keep && typeof caches !== 'undefined' ? caches.default : null;
+  const cacheKey = new Request(new URL(`/v2/data/${file}`, request.url).toString());
+  if (cache) {
+    let hit = null;
+    try {
+      hit = await cache.match(cacheKey);
+    } catch {
+      hit = null;
+    }
+    if (hit) {
+      const etag = hit.headers.get('etag');
+      const modified = hit.headers.get('last-modified');
+      const size = Number(hit.headers.get('content-length') || 0);
+      if (size && size <= MEMO_MAX_FILE) {
+        const bytes = await hit.arrayBuffer();
+        // Kept in memory only for what is left of the cache's own time.
+        const age = Number(hit.headers.get('age') || 0);
+        memoPut(file, { until: now + Math.max(1, keep - age) * 1000, etag, modified, bytes });
+        return dataReply(request, file, { etag, modified, body: bytes }, 'cache');
+      }
+      return dataReply(request, file, { etag, modified, body: hit.body }, 'cache');
+    }
+  }
+
+  // 3. R2.
   let object;
   try {
-    object = await env.DATA.get(file, { onlyIf: request.headers });
+    object = keep ? await env.DATA.get(file) : await env.DATA.get(file, { onlyIf: request.headers });
   } catch {
     throw new HttpError(503, 'data_unreachable');
   }
-  if (!object) throw new HttpError(404, 'not_found');
-  const headers = {
-    etag: object.httpEtag,
-    'content-type': dataType(file),
-    'cache-control': 'no-cache',
-  };
-  if (object.uploaded) headers['last-modified'] = object.uploaded.toUTCString();
-  // No body means the caller's copy (If-None-Match) is still current.
-  if (!('body' in object) || !object.body) return new Response(null, { status: 304, headers });
-  if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
-  return new Response(object.body, { status: 200, headers });
+  if (!object) {
+    if (keep) memoPut(file, { until: now + keep * 1000, missing: true });
+    throw new HttpError(404, 'not_found');
+  }
+  const etag = object.httpEtag;
+  const modified = object.uploaded ? object.uploaded.toUTCString() : null;
+  if (!keep) {
+    // No copies kept: R2 itself answers the caller's "has this changed?" check.
+    const headers = { etag, 'content-type': dataType(file), 'cache-control': 'no-cache', 'x-data-from': 'r2' };
+    if (modified) headers['last-modified'] = modified;
+    if (!('body' in object) || !object.body) return new Response(null, { status: 304, headers });
+    if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
+    return new Response(object.body, { status: 200, headers });
+  }
+  const stored = { etag, 'content-type': dataType(file), 'cache-control': `public, max-age=${keep}` };
+  if (modified) stored['last-modified'] = modified;
+  if (object.size <= MEMO_MAX_FILE) {
+    const bytes = await object.arrayBuffer();
+    memoPut(file, { until: now + keep * 1000, etag, modified, bytes });
+    if (cache && ctx) ctx.waitUntil(cache.put(cacheKey, new Response(bytes, { headers: stored })).catch(() => {}));
+    return dataReply(request, file, { etag, modified, body: bytes }, 'r2');
+  }
+  // Big files: sent on as they arrive, with a second copy going into the cache.
+  let body = object.body;
+  if (cache && ctx) {
+    const [mine, forCache] = object.body.tee();
+    body = mine;
+    stored['content-length'] = String(object.size);
+    ctx.waitUntil(cache.put(cacheKey, new Response(forCache, { headers: stored })).catch(() => {}));
+  }
+  return dataReply(request, file, { etag, modified, body }, 'r2');
 }
 
 // The ESPN score job in nuvio-data, started from the cron below.
@@ -662,7 +783,7 @@ export default {
     ctx.waitUntil(startEspnJob(env));
   },
 
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const { pathname } = new URL(request.url);
       if (pathname === '/v1/health') {
@@ -675,6 +796,7 @@ export default {
           espnTimer: env.ESPN_TRIGGER_TOKEN ? 'ready' : 'not_set',
           appKey: appKeys(env).length ? 'ready' : env.APP_KEY ? 'key_too_short' : 'not_set',
           sportsData: env.DATA ? 'ready' : 'not_set',
+          dataCacheSeconds: cacheSeconds(env),
           oldDoor: oldDoorClosesAt(env) === null ? 'open' : oldDoorClosed(env) ? 'closed' : `closes ${new Date(oldDoorClosesAt(env)).toISOString().slice(0, 10)}`,
         });
       }
@@ -685,7 +807,7 @@ export default {
       if (v2 && !(await appAllowed(request, env))) {
         throw new HttpError(appKeys(env).length ? 403 : 503, appKeys(env).length ? 'app_not_allowed' : 'app_key_not_set');
       }
-      if (pathname.startsWith('/v2/data/')) return await getData(request, env, pathname.slice('/v2/data/'.length));
+      if (pathname.startsWith('/v2/data/')) return await getData(request, env, pathname.slice('/v2/data/'.length), ctx);
 
       const routes = {
         '/setup': { GET: getSetup, PUT: (e, u) => putSetup(request, e, u), DELETE: deleteSetup },

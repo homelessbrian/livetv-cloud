@@ -52,6 +52,8 @@ Secret: `ESPN_TRIGGER_TOKEN`, a fine-grained GitHub token for `homelessbrian/nuv
 
 ## Settings (optional)
 
+- `DATA_CACHE_SECONDS`: how long each sports file is kept before R2 is read again, default 60 (0 = read R2 every time). Copies are kept in the Worker's memory and in Cloudflare's cache; the `x-data-from` header on each answer says which one answered (`memory`, `cache` or `r2`).
+
 - `NUVIO_API_URL`: Nuvio's server, default `https://api.nuvio.tv`.
 - `NUVIO_PUBLISHABLE_KEY`: only used if a request has no `apikey` header.
 
