@@ -15,6 +15,7 @@ let asked = [];
 let answer = (path, day) => JSON.stringify({ events: [{ id: `${path}-${day}`, status: { type: { state: 'pre' } } }] });
 let leaguesUp = true;
 let espnUp = true;
+let github = [];
 
 const make = (bindings = {}) =>
   new Miniflare({
@@ -27,6 +28,10 @@ const make = (bindings = {}) =>
     outboundService: async (req) => {
       const url = new URL(req.url);
       if (url.hostname === 'raw.githubusercontent.com') return leaguesUp ? new Response(LEAGUES) : new Response('', { status: 404 });
+      if (url.hostname === 'api.github.com') {
+        github.push({ path: url.pathname, body: await req.json(), auth: req.headers.get('authorization') });
+        return new Response(null, { status: 204 });
+      }
       if (url.hostname === 'site.api.espn.com') {
         if (!espnUp) return new Response('', { status: 404 });
         const path = url.pathname.replace('/apis/site/v2/sports/', '').replace('/scoreboard', '');
@@ -186,6 +191,18 @@ await test('ESPN_FETCH=off leaves it all to the nuvio-data job', async () => {
   assert.equal(await (await off.getR2Bucket('DATA')).get('espn/_state.json'), null);
   assert.equal((await (await off.dispatchFetch('https://x.test/v1/health')).json()).espnFetch, 'off');
   await off.dispose();
+});
+
+await test('with the GitHub token, both nuvio-data jobs are started', async () => {
+  const withToken = make({ ESPN_TRIGGER_TOKEN: 'gh-token' });
+  github = [];
+  await (await withToken.getWorker()).scheduled({ cron: '*/5 * * * *' });
+  const espn = github.find((g) => g.path.endsWith('/espn-schedule.yml/dispatches'));
+  const scores = github.find((g) => g.path.endsWith('/nuvio-data.yml/dispatches'));
+  assert.deepEqual(espn?.body, { ref: 'main' });
+  assert.deepEqual(scores?.body, { ref: 'main', inputs: { mode: 'scores' } });
+  assert.equal(scores.auth, 'Bearer gh-token');
+  await withToken.dispose();
 });
 
 console.log(`${passed} passed`);

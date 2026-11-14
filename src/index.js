@@ -751,15 +751,19 @@ async function getData(request, env, file, ctx) {
   return dataReply(request, file, { etag, modified, body }, 'r2');
 }
 
-// The ESPN score job in nuvio-data, started from the cron below.
-const ESPN_JOB = 'repos/homelessbrian/nuvio-data/actions/workflows/espn-schedule.yml/dispatches';
+// nuvio-data jobs started from the cron below: the ESPN job (ready-made score files) and the
+// TheSportsDB scores run (games on now). GitHub's own 5-minute schedules are often skipped for hours.
+const NUVIO_DATA_JOBS = [
+  { name: 'ESPN job', path: 'repos/homelessbrian/nuvio-data/actions/workflows/espn-schedule.yml/dispatches', body: { ref: 'main' } },
+  { name: 'TheSportsDB scores', path: 'repos/homelessbrian/nuvio-data/actions/workflows/nuvio-data.yml/dispatches', body: { ref: 'main', inputs: { mode: 'scores' } } },
+];
 
-/** Asks GitHub to run the ESPN score job now. Returns GitHub's status code, or 0 if it was not asked. */
-async function startEspnJob(env) {
+/** Asks GitHub to run one nuvio-data job now. Returns GitHub's status code, 0 if not asked, -1 if unreachable. */
+async function startJob(env, job) {
   const token = typeof env.ESPN_TRIGGER_TOKEN === 'string' ? env.ESPN_TRIGGER_TOKEN.trim() : '';
   if (!token) return 0;
   try {
-    const res = await fetch(`${GITHUB_API}/${ESPN_JOB}`, {
+    const res = await fetch(`${GITHUB_API}/${job.path}`, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${token}`,
@@ -768,16 +772,19 @@ async function startEspnJob(env) {
         'user-agent': 'livetv-cloud',
         'x-github-api-version': '2022-11-28',
       },
-      body: JSON.stringify({ ref: 'main' }),
+      body: JSON.stringify(job.body),
       signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     });
-    if (res.status !== 204) console.log(`ESPN job not started: GitHub answered ${res.status}`);
+    if (res.status !== 204) console.log(`${job.name} not started: GitHub answered ${res.status}`);
     return res.status;
   } catch {
-    console.log('ESPN job not started: GitHub unreachable');
+    console.log(`${job.name} not started: GitHub unreachable`);
     return -1;
   }
 }
+
+const startEspnJob = (env) => startJob(env, NUVIO_DATA_JOBS[0]);
+const startScoresJob = (env) => startJob(env, NUVIO_DATA_JOBS[1]);
 
 // ---------------------------------------------------------------------------------------------
 // ESPN scores, fetched here (every 5 minutes, the cron) and saved straight to the R2 bucket.
@@ -994,6 +1001,8 @@ export default {
         .catch((e) => console.log(`ESPN round failed: ${e?.message || e}`))
         .then(() => startEspnJob(env)),
     );
+    // TheSportsDB scores don't wait for ESPN.
+    ctx.waitUntil(startScoresJob(env));
   },
 
   async fetch(request, env, ctx) {

@@ -48,7 +48,9 @@ Secrets (Settings → Variables and secrets): `TESTER_KEY` (16+ characters; seve
 
 The cron in `wrangler.toml` runs an ESPN round: it asks ESPN for yesterday to a week ahead for every league in nuvio-data's `espn-leagues.txt` (same timing as nuvio-data's old `scripts/espn.py`) and saves the answers straight to the R2 bucket (`espn/<league>.json`). A league's file is saved only when one of its days really changed, or when its saved time gets old (15 min for today, 1 h for yesterday/tomorrow, 4 h further ahead). When each day was last asked for, and how the last round went, is kept in `espn/_state.json`. `/v1/health` shows the last round under `espnFetch`.
 
-Then it starts nuvio-data's "ESPN shared schedule cache" job (GitHub often skips that job's own schedule for hours), which gets these files, makes the ready-made ones and keeps copies in that repo. If the Worker's last round is missing, over 15 minutes old or went badly (half the questions unanswered), that job asks ESPN itself as before.
+Every 5 minutes it also starts nuvio-data's "Nuvio data" job in scores mode (TheSportsDB scores for games on now), for the same reason.
+
+After the ESPN round it starts nuvio-data's "ESPN shared schedule cache" job (GitHub often skips that job's own schedule for hours), which gets these files, makes the ready-made ones and keeps copies in that repo. If the Worker's last round is missing, over 15 minutes old or went badly (half the questions unanswered), that job asks ESPN itself as before.
 
 Secret: `ESPN_TRIGGER_TOKEN`, a fine-grained GitHub token for `homelessbrian/nuvio-data` only, with **Actions: Read and write**. Until it is set the job isn't started and `/v1/health` shows `espnTimer: not_set`.
 
