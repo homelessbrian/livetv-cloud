@@ -11,6 +11,12 @@
 //   GET    /v1/setup/previous  the copy from before the last save  200 | 404
 //   GET    /v1/health          is the service up                   200
 //
+// Our own apps use the same routes under /v2/ (/v2/setup, /v2/setup/previous), which also need
+// the app key (see "App key" below). The /v1/ setup routes are the old open door: they keep
+// working for apps that haven't updated yet, until the date in OLD_DOOR_CLOSES_AT.
+//
+//   GET    /v2/data/<file>     a sports data file (app key only)   200 | 304 | 404
+//
 // Every 5 minutes (the cron in wrangler.toml) it also asks GitHub to run nuvio-data's "ESPN shared
 // schedule cache" job, because GitHub's own schedule for it is often skipped for hours. Needs the
 // secret ESPN_TRIGGER_TOKEN (a GitHub token that may only run Actions in nuvio-data); without it
@@ -548,6 +554,81 @@ async function testUpdates(request, env, pathname) {
   throw new HttpError(404, 'not_found');
 }
 
+// ---------------------------------------------------------------------------------------------
+// App key: only our own apps (TV and phone) may use the /v2/ routes.
+//
+// The key is put into our release and test builds from a GitHub secret (never in the source), so
+// other people's builds of the code don't have it. Secret (Cloudflare dashboard):
+//   APP_KEY   the key (24+ characters; several can be given, separated by commas, to change it)
+// Until it is set every /v2/ route is refused.
+//
+// OLD_DOOR_CLOSES_AT (a plain variable, e.g. 2026-12-01): from then on the old /v1/setup routes
+// answer 410 update_required. Not set = the old door stays open.
+// ---------------------------------------------------------------------------------------------
+
+const MIN_APP_KEY_LENGTH = 24;
+
+const appKeys = (env) =>
+  String(env.APP_KEY || '').split(',').map((k) => k.trim()).filter((k) => k.length >= MIN_APP_KEY_LENGTH);
+
+async function appAllowed(request, env) {
+  const given = request.headers.get('x-app-key') || '';
+  const keys = appKeys(env);
+  if (!given || keys.length === 0) return false;
+  const givenHash = await sha256Hex(given);
+  let allowed = false;
+  for (const key of keys) if (sameHex(givenHash, await sha256Hex(key))) allowed = true;
+  return allowed;
+}
+
+/** When the old open door closes (ms), or null if it stays open. */
+function oldDoorClosesAt(env) {
+  const at = Date.parse(String(env.OLD_DOOR_CLOSES_AT || '').trim());
+  return Number.isFinite(at) ? at : null;
+}
+
+const oldDoorClosed = (env) => {
+  const at = oldDoorClosesAt(env);
+  return at !== null && Date.now() >= at;
+};
+
+// ---------------------------------------------------------------------------------------------
+// Sports data: the files the nuvio-data job makes, kept in the R2 bucket bound as DATA (the job
+// uploads each file it changes). Handed only to callers with the app key. The app's own
+// "has this changed?" check (If-None-Match) is answered with 304 and no file.
+// ---------------------------------------------------------------------------------------------
+
+const DATA_PATH = /^[A-Za-z0-9][A-Za-z0-9._-]*(\/[A-Za-z0-9][A-Za-z0-9._-]*){0,6}$/;
+
+function dataType(name) {
+  if (/\.json$/i.test(name)) return 'application/json; charset=utf-8';
+  if (/\.txt$/i.test(name)) return 'text/plain; charset=utf-8';
+  return 'application/octet-stream';
+}
+
+async function getData(request, env, file) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') throw new HttpError(405, 'method_not_allowed');
+  if (!DATA_PATH.test(file) || file.includes('..')) throw new HttpError(404, 'not_found');
+  if (!env.DATA) throw new HttpError(503, 'data_not_set');
+  let object;
+  try {
+    object = await env.DATA.get(file, { onlyIf: request.headers });
+  } catch {
+    throw new HttpError(503, 'data_unreachable');
+  }
+  if (!object) throw new HttpError(404, 'not_found');
+  const headers = {
+    etag: object.httpEtag,
+    'content-type': dataType(file),
+    'cache-control': 'no-cache',
+  };
+  if (object.uploaded) headers['last-modified'] = object.uploaded.toUTCString();
+  // No body means the caller's copy (If-None-Match) is still current.
+  if (!('body' in object) || !object.body) return new Response(null, { status: 304, headers });
+  if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
+  return new Response(object.body, { status: 200, headers });
+}
+
 // The ESPN score job in nuvio-data, started from the cron below.
 const ESPN_JOB = 'repos/homelessbrian/nuvio-data/actions/workflows/espn-schedule.yml/dispatches';
 
@@ -592,16 +673,29 @@ export default {
           encryption: secret.length >= MIN_SECRET_LENGTH ? 'ready' : secret ? 'secret_too_short' : 'secret_missing',
           testUpdates: testKeys(env).length > 0 && env.TEST_BUILDS_TOKEN ? 'ready' : 'not_set',
           espnTimer: env.ESPN_TRIGGER_TOKEN ? 'ready' : 'not_set',
+          appKey: appKeys(env).length ? 'ready' : env.APP_KEY ? 'key_too_short' : 'not_set',
+          sportsData: env.DATA ? 'ready' : 'not_set',
+          oldDoor: oldDoorClosesAt(env) === null ? 'open' : oldDoorClosed(env) ? 'closed' : `closes ${new Date(oldDoorClosesAt(env)).toISOString().slice(0, 10)}`,
         });
       }
       if (Object.keys(BUILD_KINDS).some((k) => pathname.startsWith(`/v1/updates/${k}/`))) return await testUpdates(request, env, pathname);
 
+      // Everything under /v2/ is for our own apps only.
+      const v2 = pathname.startsWith('/v2/');
+      if (v2 && !(await appAllowed(request, env))) {
+        throw new HttpError(appKeys(env).length ? 403 : 503, appKeys(env).length ? 'app_not_allowed' : 'app_key_not_set');
+      }
+      if (pathname.startsWith('/v2/data/')) return await getData(request, env, pathname.slice('/v2/data/'.length));
+
       const routes = {
-        '/v1/setup': { GET: getSetup, PUT: (e, u) => putSetup(request, e, u), DELETE: deleteSetup },
-        '/v1/setup/previous': { GET: getPrevious },
+        '/setup': { GET: getSetup, PUT: (e, u) => putSetup(request, e, u), DELETE: deleteSetup },
+        '/setup/previous': { GET: getPrevious },
       };
-      const route = routes[pathname.replace(/\/+$/, '')];
+      const path = pathname.replace(/\/+$/, '');
+      const version = path.slice(0, 4);
+      const route = version === '/v1/' || version === '/v2/' ? routes[path.slice(3)] : null;
       if (!route) throw new HttpError(404, 'not_found');
+      if (version === '/v1/' && oldDoorClosed(env)) throw new HttpError(410, 'update_required');
       const handler = route[request.method];
       if (!handler) throw new HttpError(405, 'method_not_allowed');
 

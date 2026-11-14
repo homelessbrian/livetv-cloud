@@ -21,6 +21,15 @@ All except `/v1/health` need `Authorization: Bearer <Nuvio access token>` and th
 | DELETE | `/v1/setup` | Delete the saved copy |
 | GET | `/v1/setup/previous` | The copy from before the last save, or 404 |
 
+## App key door (/v2/)
+
+Our own apps use `/v2/setup` and `/v2/setup/previous` (same as the `/v1/` routes, same saved copy) plus `/v2/data/<file>` for the sports files. Every `/v2/` request needs the app key in an `X-App-Key` header; other people's builds don't have it and get 403. Sync still needs the Nuvio sign-in as well.
+
+- Secret `APP_KEY` (24+ characters; several allowed, separated by commas, for changing it). The same key is the `LIVETV_APP_KEY` GitHub secret in the TV and phone repos. Until it is set every `/v2/` route answers 503.
+- Sports files come from the R2 bucket bound as `DATA` (`nuvio-sports`), which the nuvio-data job fills. An unchanged file (`If-None-Match`) is 304.
+- Variable `OLD_DOOR_CLOSES_AT` (a date such as `2026-12-01`): from then on the old `/v1/setup` routes answer 410 `update_required`. Not set = open.
+- `/v1/health` also shows `appKey`, `sportsData` and `oldDoor`.
+
 ## Test builds (private)
 
 Lets the test app and a few testers update from release files in a private GitHub repo. Only callers with the tester key get anything; everyone else gets 404. Nothing is stored.
@@ -48,4 +57,4 @@ Secret: `ESPN_TRIGGER_TOKEN`, a fine-grained GitHub token for `homelessbrian/nuv
 
 ## Tests
 
-`npm i --no-save miniflare && node test/worker.test.mjs && node test/updates.test.mjs`
+`npm i --no-save miniflare && node test/worker.test.mjs && node test/updates.test.mjs && node test/v2.test.mjs`
